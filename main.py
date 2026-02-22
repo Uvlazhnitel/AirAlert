@@ -2,6 +2,18 @@ from machine import Pin, I2C
 import time
 import framebuf
 import sh1106
+import network
+import socket
+
+try:
+    import urequests as requests
+except ImportError:
+    requests = None
+
+try:
+    import secrets
+except ImportError:
+    secrets = None
 
 # ===================== Hardware =====================
 SCD4X_ADDR = 0x62
@@ -41,6 +53,22 @@ SCD_RESTART_MS = 90000
 EMA_CO2_ALPHA = 0.35
 EMA_T_ALPHA = 0.20
 EMA_RH_ALPHA = 0.20
+
+# Network / Telegram
+WIFI_SSID = getattr(secrets, "WIFI_SSID", "") if secrets else ""
+WIFI_PASS = getattr(secrets, "WIFI_PASS", "") if secrets else ""
+
+TG_ENABLE = True
+TG_TOKEN = getattr(secrets, "TG_TOKEN", "").strip() if secrets else ""
+TG_CHAT_ID = getattr(secrets, "TG_CHAT_ID", 0) if secrets else 0
+TG_MIN_GAP_MS = 1500
+TG_REMIND_MS = 20 * 60 * 1000
+TG_TIMEOUT_S = 5
+WIFI_RECONNECT_MS = 10000
+
+LVL_GOOD = 0
+LVL_OK = 1
+LVL_HIGH = 2
 
 
 # ===================== Sensirion CRC =====================
@@ -159,6 +187,116 @@ class SCD41:
 
 def ema(prev, x, alpha):
     return x if prev is None else (prev + alpha * (x - prev))
+
+
+def url_escape(s):
+    out = []
+    for b in s.encode("utf-8"):
+        if (48 <= b <= 57) or (65 <= b <= 90) or (97 <= b <= 122) or b in b"-_.~":
+            out.append(chr(b))
+        elif b == 32:
+            out.append("%20")
+        else:
+            out.append("%{:02X}".format(b))
+    return "".join(out)
+
+
+def level_from_co2(co2):
+    if co2 < 800:
+        return LVL_GOOD
+    if co2 <= 1500:
+        return LVL_OK
+    return LVL_HIGH
+
+
+def wifi_connect(timeout_ms=15000, attempts=3):
+    wlan = network.WLAN(network.STA_IF)
+    if not WIFI_SSID:
+        try:
+            wlan.active(True)
+        except Exception:
+            pass
+        return wlan
+
+    for n in range(attempts):
+        try:
+            # Hard reset STA state to recover from "Wifi Internal State Error"
+            try:
+                wlan.disconnect()
+            except Exception:
+                pass
+            wlan.active(False)
+            time.sleep_ms(250)
+            wlan.active(True)
+            time.sleep_ms(250)
+        except Exception as e:
+            print("WiFi iface reset error:", e)
+
+        if wlan.isconnected():
+            return wlan
+
+        try:
+            wlan.connect(WIFI_SSID, WIFI_PASS)
+        except Exception as e:
+            print("WiFi connect error:", e, "attempt", n + 1, "/", attempts)
+            time.sleep_ms(700)
+            continue
+
+        t0 = time.ticks_ms()
+        while not wlan.isconnected():
+            if time.ticks_diff(time.ticks_ms(), t0) > timeout_ms:
+                break
+            time.sleep_ms(200)
+
+        if wlan.isconnected():
+            return wlan
+
+        print("WiFi timeout attempt", n + 1, "/", attempts)
+        time.sleep_ms(700)
+
+    return wlan
+
+
+_last_tg_send = 0
+
+
+def tg_send(text):
+    global _last_tg_send
+
+    if (not TG_ENABLE) or (not TG_TOKEN) or (TG_CHAT_ID == 0):
+        return False
+    if requests is None:
+        return False
+
+    now = time.ticks_ms()
+    if time.ticks_diff(now, _last_tg_send) < TG_MIN_GAP_MS:
+        return False
+
+    url = "https://api.telegram.org/bot{}/sendMessage?chat_id={}&text={}".format(
+        TG_TOKEN, TG_CHAT_ID, url_escape(text)
+    )
+    r = None
+    try:
+        r = requests.get(url)
+        code = getattr(r, "status_code", None)
+        if code is not None and code != 200:
+            print("TG HTTP:", code)
+            return False
+        _last_tg_send = now
+        return True
+    except Exception as e:
+        print("TG send error:", e)
+        return False
+    finally:
+        try:
+            if r:
+                r.close()
+        except Exception:
+            pass
+
+
+def tg_send_alert(text):
+    return tg_send(text)
 
 
 # ===================== UI helpers =====================
@@ -310,6 +448,14 @@ def draw_error(oled, line1, line2=""):
 def main():
     print("=== CO2 OLED Monitor ===")
 
+    try:
+        socket.setdefaulttimeout(TG_TIMEOUT_S)
+    except Exception:
+        pass
+
+    wlan = wifi_connect()
+    print("WiFi connected:", wlan.isconnected())
+
     i2c_scd = I2C(0, sda=Pin(SCD_SDA), scl=Pin(SCD_SCL), freq=SCD_I2C_FREQ)
     print("SCD I2C scan:", [hex(x) for x in i2c_scd.scan()])
 
@@ -382,6 +528,7 @@ def main():
     last_screen_switch = time.ticks_ms()
     last_ready_log = time.ticks_add(time.ticks_ms(), -READY_LOG_EVERY_MS)
     last_ready_poll = time.ticks_add(time.ticks_ms(), -READY_POLL_MS)
+    last_wifi = time.ticks_ms()
     last_sample_ms = None
     co2 = None
     temp = None
@@ -393,6 +540,8 @@ def main():
     last_restart = warm_start
     ready_raw = 0
     screen = 0
+    prev_lvl = LVL_GOOD
+    last_remind = time.ticks_add(time.ticks_ms(), -TG_REMIND_MS)
 
     while True:
         now = time.ticks_ms()
@@ -415,6 +564,34 @@ def main():
                     print("RAW CO2:{} T:{:.2f} RH:{:.2f} | FILT CO2:{} T:{:.2f} RH:{:.2f}".format(
                         co2, temp, rh, int(round(co2_f)), temp_f, rh_f
                     ))
+
+                    lvl = level_from_co2(co2_f)
+                    if wlan.isconnected() and TG_ENABLE:
+                        if (prev_lvl != LVL_HIGH) and (lvl == LVL_HIGH):
+                            if tg_send_alert(
+                                "Ventilate now\nCO2: {} ppm\nT: {:.1f} C\nRH: {:.1f}%".format(
+                                    int(round(co2_f)), temp_f, rh_f
+                                )
+                            ):
+                                print("TG alert: HIGH sent")
+                                last_remind = now
+                        elif (lvl == LVL_HIGH) and (time.ticks_diff(now, last_remind) > TG_REMIND_MS):
+                            if tg_send_alert(
+                                "Reminder: ventilate\nCO2: {} ppm\nT: {:.1f} C\nRH: {:.1f}%".format(
+                                    int(round(co2_f)), temp_f, rh_f
+                                )
+                            ):
+                                print("TG alert: HIGH reminder sent")
+                                last_remind = now
+                        elif (prev_lvl == LVL_HIGH) and (lvl == LVL_GOOD):
+                            if tg_send_alert(
+                                "Air is back to normal\nCO2: {} ppm\nT: {:.1f} C\nRH: {:.1f}%".format(
+                                    int(round(co2_f)), temp_f, rh_f
+                                )
+                            ):
+                                print("TG alert: GOOD sent")
+                    prev_lvl = lvl
+
                     if not oled_ok:
                         try:
                             i2c_oled = I2C(1, sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=OLED_I2C_FREQ)
@@ -435,6 +612,13 @@ def main():
             last_ready_log = now
             age = "-" if last_sample_ms is None else str(time.ticks_diff(now, last_sample_ms) // 1000)
             print("ready_raw:", ready_raw, "sample_age_s:", age)
+
+        if time.ticks_diff(now, last_wifi) > WIFI_RECONNECT_MS:
+            last_wifi = now
+            if not wlan.isconnected():
+                wlan = wifi_connect()
+                if wlan.isconnected():
+                    print("WiFi reconnected")
 
         stale = False
         if last_sample_ms is not None and time.ticks_diff(now, last_sample_ms) > SCD_RESTART_MS:
