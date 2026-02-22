@@ -19,8 +19,16 @@ H = 64
 SCD_I2C_FREQ = 50_000
 OLED_I2C_FREQ = 100_000
 
-# Display correction (shown temperature only)
-TEMP_CORR_C = 4.0
+# Accuracy/config per SCD41 datasheet
+ASC_ENABLED = False
+ASC_TARGET_PPM = None          # e.g. 420, None = keep default target
+AMBIENT_PRESSURE_PA = None     # e.g. 101300, overrides altitude if set
+ALTITUDE_M = 0                 # used when AMBIENT_PRESSURE_PA is None
+TEMP_OFFSET_C = None           # internal SCD temp offset (0..20C), None = keep default
+PERSIST_SETTINGS = False       # write settings to sensor EEPROM (use sparingly)
+
+# Display correction only (does not affect sensor math)
+TEMP_CORR_C = 1.9
 
 # Display refresh rate
 UI_REFRESH_MS = 1200
@@ -28,6 +36,11 @@ SCREEN_SWITCH_MS = 5000
 READY_LOG_EVERY_MS = 3000
 READY_POLL_MS = 500
 SCD_RESTART_MS = 90000
+
+# EMA for smoother display while keeping raw logs
+EMA_CO2_ALPHA = 0.35
+EMA_T_ALPHA = 0.20
+EMA_RH_ALPHA = 0.20
 
 
 # ===================== Sensirion CRC =====================
@@ -108,6 +121,44 @@ class SCD41:
         temp = -45.0 + 175.0 * (t_raw / 65535.0)
         rh = 100.0 * (rh_raw / 65535.0)
         return co2_raw, temp, rh
+
+    def set_asc_enabled(self, enabled):
+        self._write_cmd(0x2416, [1 if enabled else 0])
+        time.sleep_ms(1)
+
+    def set_asc_target_ppm(self, ppm):
+        ppm = int(max(400, min(2000, ppm)))
+        self._write_cmd(0x243A, [ppm])
+        time.sleep_ms(1)
+
+    def set_sensor_altitude(self, altitude_m):
+        altitude_m = int(max(0, min(3000, altitude_m)))
+        self._write_cmd(0x2427, [altitude_m])
+        time.sleep_ms(1)
+
+    def set_ambient_pressure_pa(self, pressure_pa):
+        hpa = int(round(float(pressure_pa) / 100.0))
+        hpa = int(max(700, min(1200, hpa)))
+        self._write_cmd(0xE000, [hpa])
+        time.sleep_ms(1)
+
+    def set_temperature_offset(self, offset_c):
+        offset_c = float(offset_c)
+        if offset_c < 0:
+            offset_c = 0.0
+        if offset_c > 20:
+            offset_c = 20.0
+        word = int(round(offset_c * 65535.0 / 175.0))
+        self._write_cmd(0x241D, [word])
+        time.sleep_ms(1)
+
+    def persist_settings(self):
+        self._write_cmd(0x3615)
+        time.sleep_ms(800)
+
+
+def ema(prev, x, alpha):
+    return x if prev is None else (prev + alpha * (x - prev))
 
 
 # ===================== UI helpers =====================
@@ -285,6 +336,44 @@ def main():
     except Exception as e:
         print("reinit:", e)
 
+    # Apply accuracy settings in idle mode before start_periodic_measurement.
+    try:
+        scd.set_asc_enabled(ASC_ENABLED)
+        print("ASC:", "ON" if ASC_ENABLED else "OFF")
+    except Exception as e:
+        print("ASC config error:", e)
+
+    if ASC_TARGET_PPM is not None:
+        try:
+            scd.set_asc_target_ppm(ASC_TARGET_PPM)
+            print("ASC target:", ASC_TARGET_PPM)
+        except Exception as e:
+            print("ASC target error:", e)
+
+    try:
+        if AMBIENT_PRESSURE_PA is not None:
+            scd.set_ambient_pressure_pa(AMBIENT_PRESSURE_PA)
+            print("Pressure Pa:", AMBIENT_PRESSURE_PA)
+        else:
+            scd.set_sensor_altitude(ALTITUDE_M)
+            print("Altitude m:", ALTITUDE_M)
+    except Exception as e:
+        print("Pressure/altitude config error:", e)
+
+    if TEMP_OFFSET_C is not None:
+        try:
+            scd.set_temperature_offset(TEMP_OFFSET_C)
+            print("Temp offset C:", TEMP_OFFSET_C)
+        except Exception as e:
+            print("Temp offset config error:", e)
+
+    if PERSIST_SETTINGS:
+        try:
+            scd.persist_settings()
+            print("Sensor settings persisted")
+        except Exception as e:
+            print("Persist settings error:", e)
+
     try:
         scd.start_periodic_measurement()
     except Exception as e:
@@ -299,6 +388,9 @@ def main():
     co2 = None
     temp = None
     rh = None
+    co2_f = None
+    temp_f = None
+    rh_f = None
     warm_start = time.ticks_ms()
     last_restart = warm_start
     ready_raw = 0
@@ -314,9 +406,17 @@ def main():
                 ready = (ready_raw & 0x07FF) != 0
                 if ready:
                     co2, temp, rh = scd.read_measurement()
+                    if co2 < 350 or co2 > 10000:
+                        time.sleep_ms(20)
+                        continue
                     temp = temp + TEMP_CORR_C
+                    co2_f = ema(co2_f, co2, EMA_CO2_ALPHA)
+                    temp_f = ema(temp_f, temp, EMA_T_ALPHA)
+                    rh_f = ema(rh_f, rh, EMA_RH_ALPHA)
                     last_sample_ms = now
-                    print("CO2:{} ppm  T:{:.2f} C  RH:{:.2f}%".format(co2, temp, rh))
+                    print("RAW CO2:{} T:{:.2f} RH:{:.2f} | FILT CO2:{} T:{:.2f} RH:{:.2f}".format(
+                        co2, temp, rh, int(round(co2_f)), temp_f, rh_f
+                    ))
                     if not oled_ok:
                         try:
                             i2c_oled = I2C(1, sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=OLED_I2C_FREQ)
@@ -364,7 +464,7 @@ def main():
                 last_restart = now
 
         # Important for stability: do not touch OLED while waiting first sample.
-        if (co2 is None) or (last_sample_ms is None):
+        if (co2_f is None) or (last_sample_ms is None):
             time.sleep_ms(120)
             continue
 
@@ -374,7 +474,7 @@ def main():
                 screen = (screen + 1) % 3
             last_ui = now
             age = time.ticks_diff(now, last_sample_ms) // 1000
-            draw_screen(oled, screen, co2, temp, rh, age)
+            draw_screen(oled, screen, co2_f, temp_f, rh_f, age)
 
         time.sleep_ms(50)
 
