@@ -61,10 +61,14 @@ WIFI_PASS = getattr(secrets, "WIFI_PASS", "") if secrets else ""
 TG_ENABLE = True
 TG_TOKEN = getattr(secrets, "TG_TOKEN", "").strip() if secrets else ""
 TG_CHAT_ID = getattr(secrets, "TG_CHAT_ID", 0) if secrets else 0
+TG_ALLOWED_USER_ID = getattr(secrets, "TG_ALLOWED_USER_ID", TG_CHAT_ID) if secrets else TG_CHAT_ID
 TG_MIN_GAP_MS = 1500
 TG_REMIND_MS = 20 * 60 * 1000
 TG_TIMEOUT_S = 5
 WIFI_RECONNECT_MS = 10000
+TG_CMDS_ENABLE = True
+TG_CMD_POLL_MS = 8000
+TG_GETUPDATES_LIMIT = 10
 
 LVL_GOOD = 0
 LVL_OK = 1
@@ -258,6 +262,15 @@ def wifi_connect(timeout_ms=15000, attempts=3):
 
 
 _last_tg_send = 0
+_last_update_id = 0
+
+
+def safe_close(r):
+    try:
+        if r:
+            r.close()
+    except Exception:
+        pass
 
 
 def tg_send(text):
@@ -288,15 +301,137 @@ def tg_send(text):
         print("TG send error:", e)
         return False
     finally:
-        try:
-            if r:
-                r.close()
-        except Exception:
-            pass
+        safe_close(r)
 
 
 def tg_send_alert(text):
     return tg_send(text)
+
+
+def tg_get_updates(offset):
+    if (not TG_ENABLE) or (not TG_TOKEN) or (requests is None):
+        return None
+    url = "https://api.telegram.org/bot{}/getUpdates?timeout=0&offset={}&limit={}".format(
+        TG_TOKEN, offset, TG_GETUPDATES_LIMIT
+    )
+    r = None
+    try:
+        r = requests.get(url)
+        try:
+            return r.json()
+        except Exception:
+            return None
+    except Exception as e:
+        print("TG getUpdates error:", e)
+        return None
+    finally:
+        safe_close(r)
+
+
+def status_text(co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok):
+    lvl = "-" if co2_f is None else quality_label(co2_f)
+    return (
+        "Mode: HOME\n"
+        "CO2: {} ppm ({})\n"
+        "T: {} C\n"
+        "RH: {} %\n"
+        "Sample age: {} s\n"
+        "Sensor: {}\n"
+        "Wi-Fi: {}"
+    ).format(
+        "-" if co2_f is None else int(round(co2_f)),
+        lvl,
+        "-" if temp_f is None else "{:.1f}".format(temp_f),
+        "-" if rh_f is None else "{:.1f}".format(rh_f),
+        sample_age_s,
+        "OK" if sensor_ok else "ERR",
+        "OK" if wifi_ok else "ERR",
+    )
+
+
+def info_text(co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan):
+    lvl = "-" if co2_f is None else quality_label(co2_f)
+    return (
+        "CO2 Monitor Info\n"
+        "Mode: HOME\n"
+        "Wi-Fi: {}\n"
+        "Sensor: {}\n"
+        "Level: {}\n"
+        "Raw: CO2={} T={} RH={}\n"
+        "Filt: CO2={} T={} RH={}\n"
+        "Sample age: {} s\n"
+        "Uptime: {} s\n"
+        "Thresholds: GOOD<800 OK<=1500 HIGH>1500\n"
+        "Reminder: {} min\n"
+        "I2C SCD: {}\n"
+        "I2C OLED: {}"
+    ).format(
+        "OK" if wifi_ok else "ERR",
+        "OK" if sensor_ok else "ERR",
+        lvl,
+        "-" if co2_raw is None else int(round(co2_raw)),
+        "-" if temp_raw is None else "{:.2f}".format(temp_raw),
+        "-" if rh_raw is None else "{:.2f}".format(rh_raw),
+        "-" if co2_f is None else int(round(co2_f)),
+        "-" if temp_f is None else "{:.2f}".format(temp_f),
+        "-" if rh_f is None else "{:.2f}".format(rh_f),
+        sample_age_s,
+        uptime_s,
+        remind_ms // 60000,
+        scd_scan,
+        oled_scan,
+    )
+
+
+def tg_poll_commands(
+    co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f,
+    sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan
+):
+    global _last_update_id
+
+    if (not TG_CMDS_ENABLE) or (not TG_ENABLE) or (not TG_TOKEN) or (requests is None):
+        return
+
+    data = tg_get_updates(_last_update_id + 1)
+    if not data or not data.get("ok"):
+        return
+
+    for upd in data.get("result", []):
+        uid = upd.get("update_id", 0)
+        if uid > _last_update_id:
+            _last_update_id = uid
+
+        msg = upd.get("message")
+        if not msg:
+            continue
+
+        from_id = (msg.get("from") or {}).get("id")
+        if TG_ALLOWED_USER_ID and from_id != TG_ALLOWED_USER_ID:
+            print("TG unauthorized user:", from_id)
+            continue
+
+        text = (msg.get("text") or "").strip()
+        if not text:
+            continue
+
+        low = text.lower().strip()
+        cmd = low.split()[0]
+        if cmd.startswith("/"):
+            cmd = cmd[1:]
+        if "@" in cmd:
+            cmd = cmd.split("@", 1)[0]
+
+        print("TG cmd: /" + cmd)
+
+        if cmd == "status":
+            tg_send(status_text(co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok))
+        elif cmd == "info":
+            tg_send(info_text(
+                co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f,
+                sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan
+            ))
+        elif cmd == "help":
+            tg_send("Commands:\n/status - compact status\n/info - detailed status\n/help - command list")
 
 
 # ===================== UI helpers =====================
@@ -447,6 +582,7 @@ def draw_error(oled, line1, line2=""):
 # ===================== Main =====================
 def main():
     print("=== CO2 OLED Monitor ===")
+    boot_ms = time.ticks_ms()
 
     try:
         socket.setdefaulttimeout(TG_TIMEOUT_S)
@@ -457,7 +593,8 @@ def main():
     print("WiFi connected:", wlan.isconnected())
 
     i2c_scd = I2C(0, sda=Pin(SCD_SDA), scl=Pin(SCD_SCL), freq=SCD_I2C_FREQ)
-    print("SCD I2C scan:", [hex(x) for x in i2c_scd.scan()])
+    scd_scan = [hex(x) for x in i2c_scd.scan()]
+    print("SCD I2C scan:", scd_scan)
 
     if SCD4X_ADDR not in i2c_scd.scan():
         print("SCD41 not found")
@@ -529,6 +666,7 @@ def main():
     last_ready_log = time.ticks_add(time.ticks_ms(), -READY_LOG_EVERY_MS)
     last_ready_poll = time.ticks_add(time.ticks_ms(), -READY_POLL_MS)
     last_wifi = time.ticks_ms()
+    last_cmd = time.ticks_add(time.ticks_ms(), -TG_CMD_POLL_MS)
     last_sample_ms = None
     co2 = None
     temp = None
@@ -542,6 +680,7 @@ def main():
     screen = 0
     prev_lvl = LVL_GOOD
     last_remind = time.ticks_add(time.ticks_ms(), -TG_REMIND_MS)
+    oled_scan = "-"
 
     while True:
         now = time.ticks_ms()
@@ -595,7 +734,9 @@ def main():
                     if not oled_ok:
                         try:
                             i2c_oled = I2C(1, sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=OLED_I2C_FREQ)
-                            print("OLED I2C scan:", [hex(x) for x in i2c_oled.scan()])
+                            oled_scan_list = [hex(x) for x in i2c_oled.scan()]
+                            oled_scan = ",".join(oled_scan_list)
+                            print("OLED I2C scan:", oled_scan_list)
                             if OLED_ADDR in i2c_oled.scan():
                                 oled = sh1106.SH1106_I2C(W, H, i2c_oled, addr=OLED_ADDR)
                                 oled.sleep(False)
@@ -619,6 +760,16 @@ def main():
                 wlan = wifi_connect()
                 if wlan.isconnected():
                     print("WiFi reconnected")
+
+        if wlan.isconnected() and TG_CMDS_ENABLE and time.ticks_diff(now, last_cmd) > TG_CMD_POLL_MS:
+            last_cmd = now
+            age_s = "-" if last_sample_ms is None else str(time.ticks_diff(now, last_sample_ms) // 1000)
+            uptime_s = time.ticks_diff(now, boot_ms) // 1000
+            sensor_ok = bool(last_sample_ms is not None and time.ticks_diff(now, last_sample_ms) <= SCD_RESTART_MS)
+            tg_poll_commands(
+                co2, temp, rh, co2_f, temp_f, rh_f,
+                age_s, sensor_ok, wlan.isconnected(), uptime_s, TG_REMIND_MS, ",".join(scd_scan), oled_scan
+            )
 
         stale = False
         if last_sample_ms is not None and time.ticks_diff(now, last_sample_ms) > SCD_RESTART_MS:
