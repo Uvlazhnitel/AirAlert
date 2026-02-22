@@ -19,11 +19,15 @@ H = 64
 SCD_I2C_FREQ = 50_000
 OLED_I2C_FREQ = 100_000
 
+# Display correction (shown temperature only)
+TEMP_CORR_C = 4.0
+
 # Display refresh rate
 UI_REFRESH_MS = 1200
 SCREEN_SWITCH_MS = 5000
 READY_LOG_EVERY_MS = 3000
-SCD_RESTART_MS = 30000
+READY_POLL_MS = 500
+SCD_RESTART_MS = 90000
 
 
 # ===================== Sensirion CRC =====================
@@ -290,6 +294,7 @@ def main():
     last_ui = time.ticks_add(time.ticks_ms(), -UI_REFRESH_MS)
     last_screen_switch = time.ticks_ms()
     last_ready_log = time.ticks_add(time.ticks_ms(), -READY_LOG_EVERY_MS)
+    last_ready_poll = time.ticks_add(time.ticks_ms(), -READY_POLL_MS)
     last_sample_ms = None
     co2 = None
     temp = None
@@ -302,37 +307,44 @@ def main():
     while True:
         now = time.ticks_ms()
 
-        try:
-            ready_raw = scd.get_data_ready_raw()
-            ready = (ready_raw & 0x07FF) != 0
-            if ready:
-                co2, temp, rh = scd.read_measurement()
-                last_sample_ms = now
-                print("CO2:{} ppm  T:{:.2f} C  RH:{:.2f}%".format(co2, temp, rh))
-                if not oled_ok:
-                    try:
-                        i2c_oled = I2C(1, sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=OLED_I2C_FREQ)
-                        print("OLED I2C scan:", [hex(x) for x in i2c_oled.scan()])
-                        if OLED_ADDR in i2c_oled.scan():
-                            oled = sh1106.SH1106_I2C(W, H, i2c_oled, addr=OLED_ADDR)
-                            oled.sleep(False)
-                            oled_ok = True
-                            print("OLED init: OK")
-                        else:
-                            print("OLED not found at 0x3C")
-                    except Exception as e:
-                        print("OLED init error:", e)
-        except Exception as e:
-            print("Sensor read error:", e)
+        if time.ticks_diff(now, last_ready_poll) >= READY_POLL_MS:
+            last_ready_poll = now
+            try:
+                ready_raw = scd.get_data_ready_raw()
+                ready = (ready_raw & 0x07FF) != 0
+                if ready:
+                    co2, temp, rh = scd.read_measurement()
+                    temp = temp + TEMP_CORR_C
+                    last_sample_ms = now
+                    print("CO2:{} ppm  T:{:.2f} C  RH:{:.2f}%".format(co2, temp, rh))
+                    if not oled_ok:
+                        try:
+                            i2c_oled = I2C(1, sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=OLED_I2C_FREQ)
+                            print("OLED I2C scan:", [hex(x) for x in i2c_oled.scan()])
+                            if OLED_ADDR in i2c_oled.scan():
+                                oled = sh1106.SH1106_I2C(W, H, i2c_oled, addr=OLED_ADDR)
+                                oled.sleep(False)
+                                oled_ok = True
+                                print("OLED init: OK")
+                            else:
+                                print("OLED not found at 0x3C")
+                        except Exception as e:
+                            print("OLED init error:", e)
+            except Exception as e:
+                print("Sensor read error:", e)
 
         if time.ticks_diff(now, last_ready_log) >= READY_LOG_EVERY_MS:
             last_ready_log = now
             age = "-" if last_sample_ms is None else str(time.ticks_diff(now, last_sample_ms) // 1000)
             print("ready_raw:", ready_raw, "sample_age_s:", age)
 
-        if (co2 is None) or (last_sample_ms is None):
+        stale = False
+        if last_sample_ms is not None and time.ticks_diff(now, last_sample_ms) > SCD_RESTART_MS:
+            stale = True
+
+        if (co2 is None) or (last_sample_ms is None) or stale:
             if time.ticks_diff(now, last_restart) >= SCD_RESTART_MS:
-                print("No sample yet, restarting SCD41 measurement")
+                print("Restarting SCD41 measurement (no data/stale)")
                 try:
                     scd.stop_periodic_measurement()
                 except Exception as e:
@@ -364,7 +376,7 @@ def main():
             age = time.ticks_diff(now, last_sample_ms) // 1000
             draw_screen(oled, screen, co2, temp, rh, age)
 
-        time.sleep_ms(120)
+        time.sleep_ms(50)
 
 
 main()
