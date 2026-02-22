@@ -4,6 +4,10 @@ import framebuf
 import sh1106
 import network
 import socket
+try:
+    import ujson as json
+except ImportError:
+    import json
 
 try:
     import urequests as requests
@@ -73,6 +77,22 @@ TG_GETUPDATES_LIMIT = 10
 LVL_GOOD = 0
 LVL_OK = 1
 LVL_HIGH = 2
+
+# Runtime thresholds (persisted in state.json)
+DEFAULT_WARN_ON = 800
+DEFAULT_HIGH_ON = 1500
+DEFAULT_REMIND_MIN = 20
+
+WARN_MIN = 600
+WARN_MAX = 1400
+HIGH_MIN = 1000
+HIGH_MAX = 3000
+HIGH_OVER_WARN_MIN_GAP = 200
+REMIND_MIN_MIN = 5
+REMIND_MIN_MAX = 120
+
+STATE_FILE = "state.json"
+STATE_TMP = "state.tmp"
 
 
 # ===================== Sensirion CRC =====================
@@ -205,10 +225,82 @@ def url_escape(s):
     return "".join(out)
 
 
-def level_from_co2(co2):
-    if co2 < 800:
+def clamp_int(v, lo, hi):
+    try:
+        x = int(v)
+    except Exception:
+        x = lo
+    if x < lo:
+        x = lo
+    if x > hi:
+        x = hi
+    return x
+
+
+def validate_settings(warn_on, high_on, remind_min):
+    if warn_on < WARN_MIN or warn_on > WARN_MAX:
+        return False, "WARN out of range"
+    if high_on < HIGH_MIN or high_on > HIGH_MAX:
+        return False, "HIGH out of range"
+    if high_on < (warn_on + HIGH_OVER_WARN_MIN_GAP):
+        return False, "HIGH must be >= WARN+200"
+    if remind_min < REMIND_MIN_MIN or remind_min > REMIND_MIN_MAX:
+        return False, "REM out of range"
+    return True, "Updated"
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.loads(f.read())
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    try:
+        with open(STATE_TMP, "w") as f:
+            f.write(json.dumps(state))
+        try:
+            import uos as os
+        except ImportError:
+            import os
+        try:
+            os.remove(STATE_FILE)
+        except Exception:
+            pass
+        try:
+            os.rename(STATE_TMP, STATE_FILE)
+        except Exception:
+            with open(STATE_TMP, "r") as src, open(STATE_FILE, "w") as dst:
+                dst.write(src.read())
+            try:
+                os.remove(STATE_TMP)
+            except Exception:
+                pass
+    except Exception as e:
+        print("save_state error:", e)
+
+
+def apply_state_defaults(state):
+    warn_on = clamp_int(state.get("warn_on", DEFAULT_WARN_ON), WARN_MIN, WARN_MAX)
+    high_on = clamp_int(state.get("high_on", DEFAULT_HIGH_ON), HIGH_MIN, HIGH_MAX)
+    remind_min = clamp_int(state.get("remind_min", DEFAULT_REMIND_MIN), REMIND_MIN_MIN, REMIND_MIN_MAX)
+    if high_on < (warn_on + HIGH_OVER_WARN_MIN_GAP):
+        high_on = warn_on + HIGH_OVER_WARN_MIN_GAP
+        if high_on > HIGH_MAX:
+            warn_on = HIGH_MAX - HIGH_OVER_WARN_MIN_GAP
+            high_on = HIGH_MAX
+    state["warn_on"] = warn_on
+    state["high_on"] = high_on
+    state["remind_min"] = remind_min
+    return state
+
+
+def level_from_co2(co2, warn_on, high_on):
+    if co2 < warn_on:
         return LVL_GOOD
-    if co2 <= 1500:
+    if co2 <= high_on:
         return LVL_OK
     return LVL_HIGH
 
@@ -273,7 +365,7 @@ def safe_close(r):
         pass
 
 
-def tg_send(text):
+def tg_send(text, reply_markup=None):
     global _last_tg_send
 
     if (not TG_ENABLE) or (not TG_TOKEN) or (TG_CHAT_ID == 0):
@@ -285,16 +377,26 @@ def tg_send(text):
     if time.ticks_diff(now, _last_tg_send) < TG_MIN_GAP_MS:
         return False
 
-    url = "https://api.telegram.org/bot{}/sendMessage?chat_id={}&text={}".format(
-        TG_TOKEN, TG_CHAT_ID, url_escape(text)
-    )
     r = None
     try:
-        r = requests.get(url)
-        code = getattr(r, "status_code", None)
-        if code is not None and code != 200:
-            print("TG HTTP:", code)
-            return False
+        if reply_markup is None:
+            url = "https://api.telegram.org/bot{}/sendMessage?chat_id={}&text={}".format(
+                TG_TOKEN, TG_CHAT_ID, url_escape(text)
+            )
+            r = requests.get(url)
+            code = getattr(r, "status_code", None)
+            if code is not None and code != 200:
+                print("TG HTTP:", code)
+                return False
+        else:
+            payload = {"chat_id": TG_CHAT_ID, "text": text, "reply_markup": reply_markup}
+            data = json.dumps(payload)
+            url = "https://api.telegram.org/bot{}/sendMessage".format(TG_TOKEN)
+            r = requests.post(url, data=data, headers={"Content-Type": "application/json"})
+            code = getattr(r, "status_code", None)
+            if code is not None and code != 200:
+                print("TG HTTP:", code)
+                return False
         _last_tg_send = now
         return True
     except Exception as e:
@@ -306,6 +408,39 @@ def tg_send(text):
 
 def tg_send_alert(text):
     return tg_send(text)
+
+
+def _tg_post(method, payload):
+    if (not TG_ENABLE) or (not TG_TOKEN) or (requests is None):
+        return None
+    r = None
+    try:
+        url = "https://api.telegram.org/bot{}/{}".format(TG_TOKEN, method)
+        data = json.dumps(payload)
+        r = requests.post(url, data=data, headers={"Content-Type": "application/json"})
+        try:
+            return r.json()
+        except Exception:
+            return None
+    except Exception as e:
+        print("TG post error:", e)
+        return None
+    finally:
+        safe_close(r)
+
+
+def tg_answer_callback(callback_id, text="Updated"):
+    if not callback_id:
+        return
+    _tg_post("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+
+
+def tg_edit_message(chat_id, message_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    resp = _tg_post("editMessageText", payload)
+    return bool(resp and resp.get("ok"))
 
 
 def tg_get_updates(offset):
@@ -328,8 +463,84 @@ def tg_get_updates(offset):
         safe_close(r)
 
 
-def status_text(co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok):
-    lvl = "-" if co2_f is None else quality_label(co2_f)
+def settings_text(warn_on, high_on, remind_min):
+    return (
+        "Settings\n"
+        "WARN: {}\n"
+        "HIGH: {}\n"
+        "Reminder: {} min\n"
+        "Rules: WARN 600..1400, HIGH 1000..3000, HIGH>=WARN+200"
+    ).format(warn_on, high_on, remind_min)
+
+
+def settings_keyboard():
+    kb = [
+        [{"text": "WARN -50", "callback_data": "cfg:warn:-50"},
+         {"text": "WARN +50", "callback_data": "cfg:warn:+50"}],
+        [{"text": "HIGH -50", "callback_data": "cfg:high:-50"},
+         {"text": "HIGH +50", "callback_data": "cfg:high:+50"}],
+        [{"text": "REM -5", "callback_data": "cfg:remind:-5"},
+         {"text": "REM +5", "callback_data": "cfg:remind:+5"}],
+        [{"text": "Preset Home", "callback_data": "cfg:preset:home"},
+         {"text": "Preset Office", "callback_data": "cfg:preset:office"}],
+        [{"text": "Refresh", "callback_data": "cfg:refresh"}],
+    ]
+    return {"inline_keyboard": kb}
+
+
+def apply_cfg_callback(state, cb_data):
+    if not cb_data or not cb_data.startswith("cfg:"):
+        return False, "Bad callback"
+
+    warn_on = int(state["warn_on"])
+    high_on = int(state["high_on"])
+    remind_min = int(state["remind_min"])
+
+    parts = cb_data.split(":")
+    if len(parts) < 2:
+        return False, "Bad callback"
+
+    if parts[1] == "refresh":
+        return True, "Refreshed"
+
+    if parts[1] == "preset" and len(parts) >= 3:
+        if parts[2] == "home":
+            warn_on, high_on, remind_min = 800, 1500, 20
+        elif parts[2] == "office":
+            warn_on, high_on, remind_min = 900, 1400, 15
+        else:
+            return False, "Unknown preset"
+    elif len(parts) >= 3:
+        field = parts[1]
+        try:
+            delta = int(parts[2])
+        except Exception:
+            return False, "Bad delta"
+
+        if field == "warn":
+            warn_on += delta
+        elif field == "high":
+            high_on += delta
+        elif field == "remind":
+            remind_min += delta
+        else:
+            return False, "Bad field"
+    else:
+        return False, "Bad callback"
+
+    ok, msg = validate_settings(warn_on, high_on, remind_min)
+    if not ok:
+        return False, msg
+
+    state["warn_on"] = int(warn_on)
+    state["high_on"] = int(high_on)
+    state["remind_min"] = int(remind_min)
+    save_state(state)
+    return True, "Updated"
+
+
+def status_text(co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok, warn_on, high_on, remind_min):
+    lvl = "-" if co2_f is None else quality_label(co2_f, warn_on, high_on)
     return (
         "Mode: HOME\n"
         "CO2: {} ppm ({})\n"
@@ -337,7 +548,9 @@ def status_text(co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok):
         "RH: {} %\n"
         "Sample age: {} s\n"
         "Sensor: {}\n"
-        "Wi-Fi: {}"
+        "Wi-Fi: {}\n"
+        "WARN/HIGH: {} / {}\n"
+        "Reminder: {} min"
     ).format(
         "-" if co2_f is None else int(round(co2_f)),
         lvl,
@@ -346,11 +559,14 @@ def status_text(co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok):
         sample_age_s,
         "OK" if sensor_ok else "ERR",
         "OK" if wifi_ok else "ERR",
+        warn_on,
+        high_on,
+        remind_min,
     )
 
 
-def info_text(co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan):
-    lvl = "-" if co2_f is None else quality_label(co2_f)
+def info_text(co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, warn_on, high_on):
+    lvl = "-" if co2_f is None else quality_label(co2_f, warn_on, high_on)
     return (
         "CO2 Monitor Info\n"
         "Mode: HOME\n"
@@ -361,7 +577,7 @@ def info_text(co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f, sample_age_s, sens
         "Filt: CO2={} T={} RH={}\n"
         "Sample age: {} s\n"
         "Uptime: {} s\n"
-        "Thresholds: GOOD<800 OK<=1500 HIGH>1500\n"
+        "Thresholds: GOOD<{} OK<={} HIGH>{}\n"
         "Reminder: {} min\n"
         "I2C SCD: {}\n"
         "I2C OLED: {}"
@@ -377,6 +593,9 @@ def info_text(co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f, sample_age_s, sens
         "-" if rh_f is None else "{:.2f}".format(rh_f),
         sample_age_s,
         uptime_s,
+        warn_on,
+        high_on,
+        high_on,
         remind_ms // 60000,
         scd_scan,
         oled_scan,
@@ -385,21 +604,48 @@ def info_text(co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f, sample_age_s, sens
 
 def tg_poll_commands(
     co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f,
-    sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan
+    sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state
 ):
     global _last_update_id
 
     if (not TG_CMDS_ENABLE) or (not TG_ENABLE) or (not TG_TOKEN) or (requests is None):
-        return
+        return state["warn_on"], state["high_on"], state["remind_min"]
 
     data = tg_get_updates(_last_update_id + 1)
     if not data or not data.get("ok"):
-        return
+        return state["warn_on"], state["high_on"], state["remind_min"]
 
     for upd in data.get("result", []):
         uid = upd.get("update_id", 0)
         if uid > _last_update_id:
             _last_update_id = uid
+
+        cq = upd.get("callback_query")
+        if cq:
+            from_id = (cq.get("from") or {}).get("id")
+            if TG_ALLOWED_USER_ID and from_id != TG_ALLOWED_USER_ID:
+                print("TG unauthorized user:", from_id)
+                tg_answer_callback(cq.get("id"), "Not allowed")
+                continue
+
+            cb_id = cq.get("id")
+            cb_data = cq.get("data", "")
+            msg = cq.get("message") or {}
+            chat = msg.get("chat") or {}
+            chat_id = chat.get("id", TG_CHAT_ID)
+            message_id = msg.get("message_id")
+
+            ok, human = apply_cfg_callback(state, cb_data)
+            tg_answer_callback(cb_id, human if human else "Updated")
+
+            txt = settings_text(state["warn_on"], state["high_on"], state["remind_min"])
+            kb = settings_keyboard()
+            if message_id is not None:
+                if not tg_edit_message(chat_id, message_id, txt, kb):
+                    tg_send(txt)
+            else:
+                tg_send(txt)
+            continue
 
         msg = upd.get("message")
         if not msg:
@@ -424,14 +670,30 @@ def tg_poll_commands(
         print("TG cmd: /" + cmd)
 
         if cmd == "status":
-            tg_send(status_text(co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok))
+            tg_send(status_text(
+                co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok,
+                state["warn_on"], state["high_on"], state["remind_min"]
+            ))
         elif cmd == "info":
             tg_send(info_text(
                 co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f,
-                sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan
+                sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan,
+                state["warn_on"], state["high_on"]
             ))
+        elif cmd in ("settings", "thresholds"):
+            tg_send(settings_text(state["warn_on"], state["high_on"], state["remind_min"]))
+            tg_send("Use buttons below", reply_markup=settings_keyboard())
         elif cmd == "help":
-            tg_send("Commands:\n/status - compact status\n/info - detailed status\n/help - command list")
+            tg_send(
+                "Commands:\n"
+                "/status - compact status\n"
+                "/info - detailed status\n"
+                "/settings - thresholds/reminder\n"
+                "/thresholds - alias of /settings\n"
+                "/help - command list"
+            )
+
+    return state["warn_on"], state["high_on"], state["remind_min"]
 
 
 # ===================== UI helpers =====================
@@ -464,10 +726,10 @@ def centered_x(text, scale):
     return 0 if x < 0 else x
 
 
-def quality_label(co2):
-    if co2 < 800:
+def quality_label(co2, warn_on, high_on):
+    if co2 < warn_on:
         return "GOOD"
-    if co2 <= 1500:
+    if co2 <= high_on:
         return "OK"
     return "HIGH"
 
@@ -495,10 +757,10 @@ def draw_footer(oled, co2):
         oled.fill_rect(4, 54, fill, 8, 1)
 
 
-def draw_co2_screen(oled, co2, age_s):
+def draw_co2_screen(oled, co2, age_s, warn_on, high_on):
     oled.fill(0)
 
-    label = quality_label(co2)
+    label = quality_label(co2, warn_on, high_on)
     draw_header(oled, "CO2", age_s)
     oled.text(label, 48, 1, 0)
 
@@ -555,9 +817,9 @@ def draw_hum_screen(oled, rh, age_s):
     oled.show()
 
 
-def draw_screen(oled, screen_idx, co2, temp, rh, age_s):
+def draw_screen(oled, screen_idx, co2, temp, rh, age_s, warn_on, high_on):
     if screen_idx == 0:
-        draw_co2_screen(oled, co2, age_s)
+        draw_co2_screen(oled, co2, age_s, warn_on, high_on)
     elif screen_idx == 1:
         draw_temp_screen(oled, temp, age_s)
     else:
@@ -583,6 +845,13 @@ def draw_error(oled, line1, line2=""):
 def main():
     print("=== CO2 OLED Monitor ===")
     boot_ms = time.ticks_ms()
+
+    state = apply_state_defaults(load_state())
+    warn_on = int(state["warn_on"])
+    high_on = int(state["high_on"])
+    remind_min = int(state["remind_min"])
+    remind_ms = remind_min * 60 * 1000
+    print("Runtime settings: WARN", warn_on, "HIGH", high_on, "REM", remind_min, "min")
 
     try:
         socket.setdefaulttimeout(TG_TIMEOUT_S)
@@ -679,7 +948,7 @@ def main():
     ready_raw = 0
     screen = 0
     prev_lvl = LVL_GOOD
-    last_remind = time.ticks_add(time.ticks_ms(), -TG_REMIND_MS)
+    last_remind = time.ticks_add(time.ticks_ms(), -remind_ms)
     oled_scan = "-"
 
     while True:
@@ -704,7 +973,7 @@ def main():
                         co2, temp, rh, int(round(co2_f)), temp_f, rh_f
                     ))
 
-                    lvl = level_from_co2(co2_f)
+                    lvl = level_from_co2(co2_f, warn_on, high_on)
                     if wlan.isconnected() and TG_ENABLE:
                         if (prev_lvl != LVL_HIGH) and (lvl == LVL_HIGH):
                             if tg_send_alert(
@@ -714,7 +983,7 @@ def main():
                             ):
                                 print("TG alert: HIGH sent")
                                 last_remind = now
-                        elif (lvl == LVL_HIGH) and (time.ticks_diff(now, last_remind) > TG_REMIND_MS):
+                        elif (lvl == LVL_HIGH) and (time.ticks_diff(now, last_remind) > remind_ms):
                             if tg_send_alert(
                                 "Reminder: ventilate\nCO2: {} ppm\nT: {:.1f} C\nRH: {:.1f}%".format(
                                     int(round(co2_f)), temp_f, rh_f
@@ -766,10 +1035,11 @@ def main():
             age_s = "-" if last_sample_ms is None else str(time.ticks_diff(now, last_sample_ms) // 1000)
             uptime_s = time.ticks_diff(now, boot_ms) // 1000
             sensor_ok = bool(last_sample_ms is not None and time.ticks_diff(now, last_sample_ms) <= SCD_RESTART_MS)
-            tg_poll_commands(
+            warn_on, high_on, remind_min = tg_poll_commands(
                 co2, temp, rh, co2_f, temp_f, rh_f,
-                age_s, sensor_ok, wlan.isconnected(), uptime_s, TG_REMIND_MS, ",".join(scd_scan), oled_scan
+                age_s, sensor_ok, wlan.isconnected(), uptime_s, remind_ms, ",".join(scd_scan), oled_scan, state
             )
+            remind_ms = remind_min * 60 * 1000
 
         stale = False
         if last_sample_ms is not None and time.ticks_diff(now, last_sample_ms) > SCD_RESTART_MS:
@@ -807,7 +1077,7 @@ def main():
                 screen = (screen + 1) % 3
             last_ui = now
             age = time.ticks_diff(now, last_sample_ms) // 1000
-            draw_screen(oled, screen, co2_f, temp_f, rh_f, age)
+            draw_screen(oled, screen, co2_f, temp_f, rh_f, age, warn_on, high_on)
 
         time.sleep_ms(50)
 
