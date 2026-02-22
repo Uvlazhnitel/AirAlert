@@ -194,11 +194,9 @@ def centered_x(text, scale):
 def quality_label(co2):
     if co2 < 800:
         return "GOOD"
-    if co2 < 1200:
+    if co2 <= 1500:
         return "OK"
-    if co2 < 1800:
-        return "HIGH"
-    return "ALERT"
+    return "HIGH"
 
 
 def quality_fill_px(co2):
