@@ -14,7 +14,7 @@ Simple local air-quality monitor for ESP32-S3:
 
 ### Pin mapping
 
-- `SCD41 SDA -> GPIO8`
+- `SCD41 SDA -> GPIO3`
 - `SCD41 SCL -> GPIO9`
 - `OLED SDA -> GPIO13`
 - `OLED SCL -> GPIO12`
@@ -27,7 +27,9 @@ I2C addresses:
 
 - Stable startup sequence for SCD41
 - Sensor auto-recovery if data becomes stale
-- Three OLED pages (CO2 / TEMP / HUM), auto-switch every 5s
+- Infographic OLED UI with three pages (CO2 / TEMP / HUM), auto-switch every 5s
+- CO2 main page with large value, trend marker, and progress bar
+- OLED warmup screen before first sample; stale-data screen when samples are old
 - CO2 levels:
   - `GOOD`: `< 800 ppm`
   - `OK`: `800..1500 ppm`

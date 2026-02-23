@@ -53,6 +53,17 @@ READY_LOG_EVERY_MS = 3000
 READY_POLL_MS = 500
 OLED_INIT_RETRY_MS = 2000
 SCD_RESTART_MS = 90000
+UI_STALE_SEC = 15
+SCD_FAST_RECOVERY_MS = 25000
+I2C_SCAN_LOG_EVERY_MS = 10000
+UI_MODE = "infographic"
+UI_SHOW_TREND = True
+UI_CO2_BAR_MIN = 400
+UI_CO2_BAR_MAX = 2400
+UI_TREND_DEADBAND = 20
+UI_BLINK_HIGH = True
+UI_TEMP_TREND_DEADBAND = 0.2
+UI_RH_TREND_DEADBAND = 1.0
 
 # EMA for smoother display while keeping raw logs
 EMA_CO2_ALPHA = 0.35
@@ -751,6 +762,14 @@ def centered_x(text, scale):
     return 0 if x < 0 else x
 
 
+def clamp(v, lo, hi):
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+
 def quality_label(co2, warn_on, high_on):
     if co2 < warn_on:
         return "GOOD"
@@ -759,40 +778,81 @@ def quality_label(co2, warn_on, high_on):
     return "HIGH"
 
 
-def quality_fill_px(co2):
-    # map 400..2400 ppm -> 0..120 px
-    c = co2
-    if c < 400:
-        c = 400
-    if c > 2400:
-        c = 2400
-    return int((c - 400) * 120 / 2000)
+def trend_from_delta(delta, deadband):
+    if delta > deadband:
+        return 1
+    if delta < -deadband:
+        return -1
+    return 0
 
 
-def draw_header(oled, title, age_s):
+def draw_status_chip(oled, x, y, text, invert=False):
+    tw = len(text) * 8 + 4
+    th = 10
+    if invert:
+        oled.fill_rect(x, y, tw, th, 1)
+        oled.text(text, x + 2, y + 1, 0)
+    else:
+        oled.fill_rect(x, y, tw, th, 0)
+        oled.rect(x, y, tw, th, 1)
+        oled.text(text, x + 2, y + 1, 1)
+    return tw
+
+
+def draw_bar(oled, x, y, w, h, value, vmin, vmax):
+    oled.rect(x, y, w, h, 1)
+    if vmax <= vmin:
+        return
+    ratio = (clamp(value, vmin, vmax) - vmin) / float(vmax - vmin)
+    fill = int((w - 2) * ratio)
+    if fill > 0:
+        oled.fill_rect(x + 1, y + 1, fill, h - 2, 1)
+
+
+def draw_trend_arrow(oled, x, y, trend):
+    if trend > 0:
+        oled.text("^", x, y, 1)
+    elif trend < 0:
+        oled.text("v", x, y, 1)
+    else:
+        oled.text("-", x, y, 1)
+
+
+def draw_header(oled, title, age_s, status=None, status_blink=False):
     oled.fill_rect(0, 0, 128, 10, 1)
     oled.text(title, 2, 1, 0)
-    oled.text("{}s".format(age_s), 104, 1, 0)
+    if isinstance(age_s, int):
+        age_txt = "{}s".format(age_s)
+    else:
+        age_txt = str(age_s)
+    oled.text(age_txt, 104, 1, 0)
+    if status:
+        draw_status_chip(oled, 44, 0, status, invert=bool(status_blink))
 
 
-def draw_co2_screen(oled, co2, age_s, warn_on, high_on):
+def draw_co2_screen_v2(oled, co2, age_s, warn_on, high_on, trend_dir=0, high_blink_phase=False):
     oled.fill(0)
 
     label = quality_label(co2, warn_on, high_on)
-    draw_header(oled, "CO2", age_s)
-    oled.text(label, 48, 1, 0)
+    blink = UI_BLINK_HIGH and label == "HIGH" and high_blink_phase
+    draw_header(oled, "CO2", age_s, status=label, status_blink=blink)
 
     co2s = str(int(round(co2)))
     sc = 3 if len(co2s) <= 3 else 2
     x = centered_x(co2s, sc)
     y = 14 if sc == 3 else 18
     text_scaled(oled, co2s, x, y, sc)
-    oled.text("ppm", 98, 34, 1)
+    oled.text("ppm", 98, 35, 1)
+
+    if UI_SHOW_TREND:
+        draw_trend_arrow(oled, 118, 16, trend_dir)
+
+    draw_bar(oled, 4, 56, 120, 8, co2, UI_CO2_BAR_MIN, UI_CO2_BAR_MAX)
 
     oled.show()
 
 
-def draw_temp_screen(oled, temp, age_s):
+def draw_temp_screen(oled, temp, age_s, trend_dir=0):
     oled.fill(0)
     draw_header(oled, "TEMP", age_s)
 
@@ -818,10 +878,13 @@ def draw_temp_screen(oled, temp, age_s):
     text_scaled(oled, big, x, yb, sb)
     text_scaled(oled, dec, x + bw + 2, yd, sd)
     oled.text("C", 118, 40, 1)
+    if UI_SHOW_TREND:
+        draw_trend_arrow(oled, 118, 16, trend_dir)
+    draw_bar(oled, 4, 56, 120, 8, temp, -10, 40)
     oled.show()
 
 
-def draw_hum_screen(oled, rh, age_s):
+def draw_hum_screen(oled, rh, age_s, trend_dir=0):
     oled.fill(0)
     draw_header(oled, "HUM", age_s)
 
@@ -831,28 +894,41 @@ def draw_hum_screen(oled, rh, age_s):
     y = 16 if sc == 5 else 18
     text_scaled(oled, hs, x, y, sc)
     oled.text("%", 116, 40, 1)
+    if UI_SHOW_TREND:
+        draw_trend_arrow(oled, 118, 16, trend_dir)
+    draw_bar(oled, 4, 56, 120, 8, rh, 0, 100)
     oled.show()
 
 
-def draw_screen(oled, screen_idx, co2, temp, rh, age_s, warn_on, high_on):
+def draw_stale(oled, co2, temp, rh, age_s):
+    oled.fill(0)
+    draw_header(oled, "DATA", age_s, status="STALE")
+    oled.text("No fresh sample", 10, 18, 1)
+    oled.text("CO2 {:>4}".format(int(round(co2))), 10, 32, 1)
+    oled.text("T {:>4.1f}C RH {:>2.0f}%".format(temp, rh), 10, 44, 1)
+    oled.show()
+
+
+def draw_screen(oled, screen_idx, co2, temp, rh, age_s, warn_on, high_on, trend_dir=0, temp_trend_dir=0, rh_trend_dir=0, high_blink_phase=False):
     if screen_idx == 0:
-        draw_co2_screen(oled, co2, age_s, warn_on, high_on)
+        draw_co2_screen_v2(oled, co2, age_s, warn_on, high_on, trend_dir, high_blink_phase)
     elif screen_idx == 1:
-        draw_temp_screen(oled, temp, age_s)
+        draw_temp_screen(oled, temp, age_s, temp_trend_dir)
     else:
-        draw_hum_screen(oled, rh, age_s)
+        draw_hum_screen(oled, rh, age_s, rh_trend_dir)
 
 
 def draw_warmup(oled):
     oled.fill(0)
-    oled.text("SCD41 WARMUP", 16, 20, 1)
-    oled.text("Waiting first sample", 0, 34, 1)
+    draw_header(oled, "SENSOR", "-", status="WARMUP")
+    oled.text("SCD41 warmup", 18, 24, 1)
+    oled.text("Waiting first sample", 0, 38, 1)
     oled.show()
 
 
 def draw_error(oled, line1, line2=""):
     oled.fill(0)
-    oled.text("ERROR", 44, 6, 1)
+    draw_header(oled, "OLED", "-", status="ERROR")
     oled.text(line1[:21], 0, 24, 1)
     oled.text(line2[:21], 0, 36, 1)
     oled.show()
@@ -947,7 +1023,7 @@ def main():
         print("SCD start failed:", e)
         return
 
-    last_ui = time.ticks_add(time.ticks_ms(), -UI_REFRESH_MS)
+    last_ui_draw = time.ticks_add(time.ticks_ms(), -UI_REFRESH_MS)
     last_screen_switch = time.ticks_ms()
     last_ready_log = time.ticks_add(time.ticks_ms(), -READY_LOG_EVERY_MS)
     last_ready_poll = time.ticks_add(time.ticks_ms(), -READY_POLL_MS)
@@ -962,12 +1038,22 @@ def main():
     rh_f = None
     warm_start = time.ticks_ms()
     last_restart = warm_start
+    fast_recovery_done = False
     ready_raw = 0
-    screen = 0
+    screen_idx = 0
     prev_lvl = LVL_GOOD
     last_remind = time.ticks_add(time.ticks_ms(), -remind_ms)
     oled_scan = "-"
     last_oled_init_try = time.ticks_add(time.ticks_ms(), -OLED_INIT_RETRY_MS)
+    last_i2c_scan_log = time.ticks_add(time.ticks_ms(), -I2C_SCAN_LOG_EVERY_MS)
+    last_co2_for_trend = None
+    last_temp_for_trend = None
+    last_rh_for_trend = None
+    trend_dir = 0
+    temp_trend_dir = 0
+    rh_trend_dir = 0
+    high_blink_phase = False
+    stale_ui = False
     warmup_drawn = False
 
     while True:
@@ -980,15 +1066,25 @@ def main():
                 scan = i2c_oled.scan()
                 oled_scan_list = [hex(x) for x in scan]
                 oled_scan = ",".join(oled_scan_list)
-                print("OLED I2C scan:", oled_scan_list)
+                log_scan_now = time.ticks_diff(now, last_i2c_scan_log) >= I2C_SCAN_LOG_EVERY_MS
+                if log_scan_now:
+                    last_i2c_scan_log = now
+                    print("OLED I2C scan:", oled_scan_list)
                 if OLED_ADDR in scan:
                     oled = sh1106.SH1106_I2C(W, H, i2c_oled, addr=OLED_ADDR)
                     oled.sleep(False)
                     oled_ok = True
                     warmup_drawn = False
                     print("OLED init: OK")
+                    try:
+                        draw_warmup(oled)
+                        warmup_drawn = True
+                    except Exception as e:
+                        print("OLED warmup draw error:", e)
+                        oled_ok = False
                 else:
-                    print("OLED not found at 0x3C")
+                    if log_scan_now:
+                        print("OLED not found at 0x3C")
             except Exception as e:
                 print("OLED init error:", e)
 
@@ -1006,6 +1102,22 @@ def main():
                     co2_f = ema(co2_f, co2, EMA_CO2_ALPHA)
                     temp_f = ema(temp_f, temp, EMA_T_ALPHA)
                     rh_f = ema(rh_f, rh, EMA_RH_ALPHA)
+
+                    if last_co2_for_trend is not None:
+                        trend_dir = trend_from_delta(co2_f - last_co2_for_trend, UI_TREND_DEADBAND)
+                    else:
+                        trend_dir = 0
+                    if last_temp_for_trend is not None:
+                        temp_trend_dir = trend_from_delta(temp_f - last_temp_for_trend, UI_TEMP_TREND_DEADBAND)
+                    else:
+                        temp_trend_dir = 0
+                    if last_rh_for_trend is not None:
+                        rh_trend_dir = trend_from_delta(rh_f - last_rh_for_trend, UI_RH_TREND_DEADBAND)
+                    else:
+                        rh_trend_dir = 0
+                    last_co2_for_trend = co2_f
+                    last_temp_for_trend = temp_f
+                    last_rh_for_trend = rh_f
                     last_sample_ms = now
                     print("RAW CO2:{} T:{:.2f} RH:{:.2f} | FILT CO2:{} T:{:.2f} RH:{:.2f}".format(
                         co2, temp, rh, int(round(co2_f)), temp_f, rh_f
@@ -1067,11 +1179,32 @@ def main():
             )
             remind_ms = remind_min * 60 * 1000
 
-        stale = False
+        stale_sensor = False
         if last_sample_ms is not None and time.ticks_diff(now, last_sample_ms) > SCD_RESTART_MS:
-            stale = True
+            stale_sensor = True
 
-        if (co2 is None) or (last_sample_ms is None) or stale:
+        if (not fast_recovery_done) and (last_sample_ms is None) and time.ticks_diff(now, warm_start) >= SCD_FAST_RECOVERY_MS:
+            print("Fast SCD recovery: no first sample in", SCD_FAST_RECOVERY_MS // 1000, "s")
+            try:
+                scd.stop_periodic_measurement()
+            except Exception as e:
+                print("fast stop error:", e)
+            try:
+                scd.wake_up()
+            except Exception as e:
+                print("fast wake error:", e)
+            try:
+                scd.reinit()
+            except Exception as e:
+                print("fast reinit error:", e)
+            try:
+                scd.start_periodic_measurement()
+            except Exception as e:
+                print("fast start error:", e)
+            fast_recovery_done = True
+            last_restart = now
+
+        if (co2 is None) or (last_sample_ms is None) or stale_sensor:
             if time.ticks_diff(now, last_restart) >= SCD_RESTART_MS:
                 print("Restarting SCD41 measurement (no data/stale)")
                 try:
@@ -1105,14 +1238,31 @@ def main():
             continue
 
         warmup_drawn = False
+        stale_ui = time.ticks_diff(now, last_sample_ms) > (UI_STALE_SEC * 1000)
+        high_blink_phase = ((now // 1000) & 1) == 1
 
-        if oled_ok and time.ticks_diff(now, last_ui) >= UI_REFRESH_MS:
-            if time.ticks_diff(now, last_screen_switch) >= SCREEN_SWITCH_MS:
+        if oled_ok and time.ticks_diff(now, last_ui_draw) >= UI_REFRESH_MS:
+            if (not stale_ui) and time.ticks_diff(now, last_screen_switch) >= SCREEN_SWITCH_MS:
                 last_screen_switch = now
-                screen = (screen + 1) % 3
-            last_ui = now
+                screen_idx = (screen_idx + 1) % 3
+            last_ui_draw = now
             age = time.ticks_diff(now, last_sample_ms) // 1000
-            draw_screen(oled, screen, co2_f, temp_f, rh_f, age, warn_on, high_on)
+            try:
+                if stale_ui:
+                    draw_stale(oled, co2_f, temp_f, rh_f, age)
+                elif UI_MODE == "infographic":
+                    draw_screen(
+                        oled, screen_idx, co2_f, temp_f, rh_f, age, warn_on, high_on,
+                        trend_dir=trend_dir,
+                        temp_trend_dir=temp_trend_dir,
+                        rh_trend_dir=rh_trend_dir,
+                        high_blink_phase=high_blink_phase
+                    )
+                else:
+                    draw_screen(oled, screen_idx, co2_f, temp_f, rh_f, age, warn_on, high_on)
+            except Exception as e:
+                print("OLED draw error:", e)
+                oled_ok = False
 
         time.sleep_ms(50)
 
