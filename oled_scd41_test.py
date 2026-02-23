@@ -9,7 +9,7 @@ except ImportError:
 SCD4X_ADDR = 0x62
 OLED_ADDR = 0x3C
 
-SCD_SDA = 8
+SCD_SDA = 3
 SCD_SCL = 9
 OLED_SDA = 13
 OLED_SCL = 12

@@ -2,7 +2,7 @@ from machine import Pin, I2C
 import time
 
 SCD4X_ADDR = 0x62
-SCD_SDA = 8
+SCD_SDA = 3
 SCD_SCL = 9
 
 

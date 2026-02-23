@@ -23,7 +23,7 @@ except ImportError:
 SCD4X_ADDR = 0x62
 OLED_ADDR = 0x3C
 
-SCD_SDA = 8
+SCD_SDA = 3
 SCD_SCL = 9
 OLED_SDA = 13
 OLED_SCL = 12
@@ -51,6 +51,7 @@ UI_REFRESH_MS = 1200
 SCREEN_SWITCH_MS = 5000
 READY_LOG_EVERY_MS = 3000
 READY_POLL_MS = 500
+OLED_INIT_RETRY_MS = 2000
 SCD_RESTART_MS = 90000
 
 # EMA for smoother display while keeping raw logs
@@ -73,6 +74,11 @@ WIFI_RECONNECT_MS = 10000
 TG_CMDS_ENABLE = True
 TG_CMD_POLL_MS = 8000
 TG_GETUPDATES_LIMIT = 10
+
+# Night quiet mode (local board time)
+QUIET_ENABLE = True
+QUIET_START_H = 0
+QUIET_END_H = 10
 
 LVL_GOOD = 0
 LVL_OK = 1
@@ -305,6 +311,15 @@ def level_from_co2(co2, warn_on, high_on):
     return LVL_HIGH
 
 
+def is_quiet_now():
+    if not QUIET_ENABLE:
+        return False
+    hour = time.localtime()[3]
+    if QUIET_START_H < QUIET_END_H:
+        return QUIET_START_H <= hour < QUIET_END_H
+    return (hour >= QUIET_START_H) or (hour < QUIET_END_H)
+
+
 def wifi_connect(timeout_ms=15000, attempts=3):
     wlan = network.WLAN(network.STA_IF)
     if not WIFI_SSID:
@@ -469,8 +484,16 @@ def settings_text(warn_on, high_on, remind_min):
         "WARN: {}\n"
         "HIGH: {}\n"
         "Reminder: {} min\n"
+        "Quiet mode: {} {:02d}:00-{:02d}:00 (local)\n"
         "Rules: WARN 600..1400, HIGH 1000..3000, HIGH>=WARN+200"
-    ).format(warn_on, high_on, remind_min)
+    ).format(
+        warn_on,
+        high_on,
+        remind_min,
+        "ON" if QUIET_ENABLE else "OFF",
+        QUIET_START_H,
+        QUIET_END_H
+    )
 
 
 def settings_keyboard():
@@ -481,8 +504,7 @@ def settings_keyboard():
          {"text": "HIGH +50", "callback_data": "cfg:high:+50"}],
         [{"text": "REM -5", "callback_data": "cfg:remind:-5"},
          {"text": "REM +5", "callback_data": "cfg:remind:+5"}],
-        [{"text": "Preset Home", "callback_data": "cfg:preset:home"},
-         {"text": "Preset Office", "callback_data": "cfg:preset:office"}],
+        [{"text": "Preset Home", "callback_data": "cfg:preset:home"}],
         [{"text": "Refresh", "callback_data": "cfg:refresh"}],
     ]
     return {"inline_keyboard": kb}
@@ -506,8 +528,6 @@ def apply_cfg_callback(state, cb_data):
     if parts[1] == "preset" and len(parts) >= 3:
         if parts[2] == "home":
             warn_on, high_on, remind_min = 800, 1500, 20
-        elif parts[2] == "office":
-            warn_on, high_on, remind_min = 900, 1400, 15
         else:
             return False, "Unknown preset"
     elif len(parts) >= 3:
@@ -567,6 +587,7 @@ def status_text(co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok, warn_on, 
 
 def info_text(co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, warn_on, high_on):
     lvl = "-" if co2_f is None else quality_label(co2_f, warn_on, high_on)
+    quiet_now = "YES" if is_quiet_now() else "NO"
     return (
         "CO2 Monitor Info\n"
         "Mode: HOME\n"
@@ -579,6 +600,7 @@ def info_text(co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f, sample_age_s, sens
         "Uptime: {} s\n"
         "Thresholds: GOOD<{} OK<={} HIGH>{}\n"
         "Reminder: {} min\n"
+        "Quiet now: {}\n"
         "I2C SCD: {}\n"
         "I2C OLED: {}"
     ).format(
@@ -597,6 +619,7 @@ def info_text(co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f, sample_age_s, sens
         high_on,
         high_on,
         remind_ms // 60000,
+        quiet_now,
         scd_scan,
         oled_scan,
     )
@@ -642,9 +665,9 @@ def tg_poll_commands(
             kb = settings_keyboard()
             if message_id is not None:
                 if not tg_edit_message(chat_id, message_id, txt, kb):
-                    tg_send(txt)
+                    tg_send(txt, reply_markup=kb)
             else:
-                tg_send(txt)
+                tg_send(txt, reply_markup=kb)
             continue
 
         msg = upd.get("message")
@@ -681,8 +704,10 @@ def tg_poll_commands(
                 state["warn_on"], state["high_on"]
             ))
         elif cmd in ("settings", "thresholds"):
-            tg_send(settings_text(state["warn_on"], state["high_on"], state["remind_min"]))
-            tg_send("Use buttons below", reply_markup=settings_keyboard())
+            tg_send(
+                settings_text(state["warn_on"], state["high_on"], state["remind_min"]),
+                reply_markup=settings_keyboard()
+            )
         elif cmd == "help":
             tg_send(
                 "Commands:\n"
@@ -750,13 +775,6 @@ def draw_header(oled, title, age_s):
     oled.text("{}s".format(age_s), 104, 1, 0)
 
 
-def draw_footer(oled, co2):
-    oled.rect(4, 54, 120, 8, 1)
-    fill = quality_fill_px(co2)
-    if fill > 0:
-        oled.fill_rect(4, 54, fill, 8, 1)
-
-
 def draw_co2_screen(oled, co2, age_s, warn_on, high_on):
     oled.fill(0)
 
@@ -771,7 +789,6 @@ def draw_co2_screen(oled, co2, age_s, warn_on, high_on):
     text_scaled(oled, co2s, x, y, sc)
     oled.text("ppm", 98, 34, 1)
 
-    draw_footer(oled, co2)
     oled.show()
 
 
@@ -950,9 +967,30 @@ def main():
     prev_lvl = LVL_GOOD
     last_remind = time.ticks_add(time.ticks_ms(), -remind_ms)
     oled_scan = "-"
+    last_oled_init_try = time.ticks_add(time.ticks_ms(), -OLED_INIT_RETRY_MS)
+    warmup_drawn = False
 
     while True:
         now = time.ticks_ms()
+
+        if (not oled_ok) and (time.ticks_diff(now, last_oled_init_try) >= OLED_INIT_RETRY_MS):
+            last_oled_init_try = now
+            try:
+                i2c_oled = I2C(1, sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=OLED_I2C_FREQ)
+                scan = i2c_oled.scan()
+                oled_scan_list = [hex(x) for x in scan]
+                oled_scan = ",".join(oled_scan_list)
+                print("OLED I2C scan:", oled_scan_list)
+                if OLED_ADDR in scan:
+                    oled = sh1106.SH1106_I2C(W, H, i2c_oled, addr=OLED_ADDR)
+                    oled.sleep(False)
+                    oled_ok = True
+                    warmup_drawn = False
+                    print("OLED init: OK")
+                else:
+                    print("OLED not found at 0x3C")
+            except Exception as e:
+                print("OLED init error:", e)
 
         if time.ticks_diff(now, last_ready_poll) >= READY_POLL_MS:
             last_ready_poll = now
@@ -976,21 +1014,25 @@ def main():
                     lvl = level_from_co2(co2_f, warn_on, high_on)
                     if wlan.isconnected() and TG_ENABLE:
                         if (prev_lvl != LVL_HIGH) and (lvl == LVL_HIGH):
-                            if tg_send_alert(
-                                "Ventilate now\nCO2: {} ppm\nT: {:.1f} C\nRH: {:.1f}%".format(
-                                    int(round(co2_f)), temp_f, rh_f
-                                )
-                            ):
-                                print("TG alert: HIGH sent")
-                                last_remind = now
+                            if is_quiet_now():
+                                print("TG quiet: HIGH muted")
+                            else:
+                                if tg_send_alert(
+                                    "Ventilate now\nCO2: {} ppm\nT: {:.1f} C\nRH: {:.1f}%".format(
+                                        int(round(co2_f)), temp_f, rh_f
+                                    )
+                                ):
+                                    print("TG alert: HIGH sent")
+                                    last_remind = now
                         elif (lvl == LVL_HIGH) and (time.ticks_diff(now, last_remind) > remind_ms):
-                            if tg_send_alert(
-                                "Reminder: ventilate\nCO2: {} ppm\nT: {:.1f} C\nRH: {:.1f}%".format(
-                                    int(round(co2_f)), temp_f, rh_f
-                                )
-                            ):
-                                print("TG alert: HIGH reminder sent")
-                                last_remind = now
+                            if not is_quiet_now():
+                                if tg_send_alert(
+                                    "Reminder: ventilate\nCO2: {} ppm\nT: {:.1f} C\nRH: {:.1f}%".format(
+                                        int(round(co2_f)), temp_f, rh_f
+                                    )
+                                ):
+                                    print("TG alert: HIGH reminder sent")
+                                    last_remind = now
                         elif (prev_lvl == LVL_HIGH) and (lvl == LVL_GOOD):
                             if tg_send_alert(
                                 "Air is back to normal\nCO2: {} ppm\nT: {:.1f} C\nRH: {:.1f}%".format(
@@ -999,22 +1041,6 @@ def main():
                             ):
                                 print("TG alert: GOOD sent")
                     prev_lvl = lvl
-
-                    if not oled_ok:
-                        try:
-                            i2c_oled = I2C(1, sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=OLED_I2C_FREQ)
-                            oled_scan_list = [hex(x) for x in i2c_oled.scan()]
-                            oled_scan = ",".join(oled_scan_list)
-                            print("OLED I2C scan:", oled_scan_list)
-                            if OLED_ADDR in i2c_oled.scan():
-                                oled = sh1106.SH1106_I2C(W, H, i2c_oled, addr=OLED_ADDR)
-                                oled.sleep(False)
-                                oled_ok = True
-                                print("OLED init: OK")
-                            else:
-                                print("OLED not found at 0x3C")
-                        except Exception as e:
-                            print("OLED init error:", e)
             except Exception as e:
                 print("Sensor read error:", e)
 
@@ -1066,10 +1092,19 @@ def main():
                     print("start error:", e)
                 last_restart = now
 
-        # Important for stability: do not touch OLED while waiting first sample.
+        # Keep OLED independent from first sample; show warmup until data arrives.
         if (co2_f is None) or (last_sample_ms is None):
+            if oled_ok and (not warmup_drawn):
+                try:
+                    draw_warmup(oled)
+                    warmup_drawn = True
+                except Exception as e:
+                    print("OLED warmup draw error:", e)
+                    oled_ok = False
             time.sleep_ms(120)
             continue
+
+        warmup_drawn = False
 
         if oled_ok and time.ticks_diff(now, last_ui) >= UI_REFRESH_MS:
             if time.ticks_diff(now, last_screen_switch) >= SCREEN_SWITCH_MS:
