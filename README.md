@@ -4,7 +4,7 @@ Simple local air-quality monitor for ESP32-S3:
 - Reads `CO2`, `temperature`, and `humidity` from `SCD41`
 - Shows data on `SH1106` OLED (`128x64`) with 3 rotating screens
 - Sends Telegram alerts when ventilation is needed
-- Supports Telegram control commands and inline settings buttons
+- Supports Telegram control commands (command-only mode)
 
 ## Hardware
 
@@ -106,29 +106,27 @@ mpremote connect /dev/cu.usbmodemXXXX run oled_scd41_test.py
 
 ## Telegram commands
 
-- `/menu` — main entrypoint (Home with inline sections)
+- `/menu` — main entrypoint (text command index)
 - `/status` — compact status view (alias)
 - `/info` — details/diagnostics view (alias)
 - `/settings` — full settings view (WARN/HIGH/REM)
 - `/thresholds` — thresholds-only view (WARN/HIGH)
 - `/help` — help view (alias)
 
-### Menu sections (inline)
+Inline buttons are currently disabled (`TG_INLINE_KEYBOARD_ENABLE = False`).
+Use commands only.
 
-- `Status` — compact daily metrics
-- `Details` — extended diagnostics (raw/filtered, uptime, scans)
-- `Controls` — quick actions (`Preset Home`)
-- `Settings` — WARN/HIGH/REM tuning
-- `Help` — command overview
+## Time & Quiet mode
 
-### Settings buttons
-
-- `WARN -50 / +50`
-- `HIGH -50 / +50`
-- `REM -5 / +5` (minutes)
-- `Preset Home` (`WARN=800`, `HIGH=1500`, `REM=20`)
-
-All settings changes are validated and saved to `state.json`, so they survive reboot.
+- Quiet window is configured by:
+  - `QUIET_START_H`
+  - `QUIET_END_H`
+- Time sync is performed via NTP (`ntptime`) when Wi-Fi is available.
+- Local time is computed from UTC + timezone + DST:
+  - `TZ_OFFSET_MIN = 120` (Riga base offset)
+  - `DST_ENABLE = True`, `DST_REGION = "EU"`
+- If time is unsynced and `TIME_UNSYNC_FAILSAFE_QUIET = False`, quiet mode is not applied (alerts are not muted by unknown clock).
+- `/info` shows local time, time sync status, and sync error details.
 
 ## Notes
 

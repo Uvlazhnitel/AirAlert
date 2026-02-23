@@ -18,6 +18,10 @@ try:
     import secrets
 except ImportError:
     secrets = None
+try:
+    import ntptime
+except ImportError:
+    ntptime = None
 
 # ===================== Hardware =====================
 SCD4X_ADDR = 0x62
@@ -86,6 +90,14 @@ TG_CMDS_ENABLE = True
 TG_CMD_POLL_MS = 8000
 TG_GETUPDATES_LIMIT = 10
 TG_INLINE_KEYBOARD_ENABLE = False
+
+# Time sync / timezone (Riga default)
+TIME_SYNC_ENABLE = True
+TIME_SYNC_EVERY_HOURS = 6
+TZ_OFFSET_MIN = 120
+DST_ENABLE = True
+DST_REGION = "EU"
+TIME_UNSYNC_FAILSAFE_QUIET = False
 
 # Night quiet mode (local board time)
 QUIET_ENABLE = True
@@ -323,10 +335,107 @@ def level_from_co2(co2, warn_on, high_on):
     return LVL_HIGH
 
 
+def _is_leap_year(y):
+    return (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0)
+
+
+def _days_in_month(y, m):
+    if m == 2:
+        return 29 if _is_leap_year(y) else 28
+    if m in (1, 3, 5, 7, 8, 10, 12):
+        return 31
+    return 30
+
+
+def _format_local_time(lt):
+    if not lt:
+        return "-"
+    return "{:04d}-{:02d}-{:02d} {:02d}:{:02d}".format(
+        lt[0], lt[1], lt[2], lt[3], lt[4]
+    )
+
+
+def is_dst_eu_utc(ts):
+    if DST_REGION != "EU":
+        return False
+    try:
+        utc = time.gmtime(ts)
+    except Exception:
+        utc = time.localtime(ts)
+
+    y, m, d, h = utc[0], utc[1], utc[2], utc[3]
+    wday = utc[6]
+
+    if m < 3 or m > 10:
+        return False
+    if 3 < m < 10:
+        return True
+
+    dim = _days_in_month(y, m)
+    weekday_last = (wday + (dim - d)) % 7
+    last_sunday = dim - ((weekday_last - 6) % 7)
+
+    if m == 3:
+        return (d > last_sunday) or (d == last_sunday and h >= 1)
+    return (d < last_sunday) or (d == last_sunday and h < 1)
+
+
+def localtime_now():
+    global _time_synced
+    try:
+        utc_ts = int(time.time())
+    except Exception:
+        return None, False
+
+    # MicroPython ports may use different epochs; validate by calendar year.
+    try:
+        base = time.gmtime(utc_ts)
+    except Exception:
+        base = time.localtime(utc_ts)
+    if not base or base[0] < 2020:
+        return None, False
+
+    dst_sec = 0
+    if DST_ENABLE and is_dst_eu_utc(utc_ts):
+        dst_sec = 3600
+
+    try:
+        local_ts = utc_ts + TZ_OFFSET_MIN * 60 + dst_sec
+        return time.localtime(local_ts), _time_synced
+    except Exception:
+        return None, False
+
+
+def sync_time_ntp():
+    global _time_synced, _time_sync_error
+    if not TIME_SYNC_ENABLE:
+        _time_synced = False
+        _time_sync_error = "time sync disabled"
+        return False, _time_sync_error
+    if ntptime is None:
+        _time_synced = False
+        _time_sync_error = "ntptime unavailable"
+        return False, _time_sync_error
+    try:
+        ntptime.settime()
+        _time_synced = True
+        _time_sync_error = ""
+        return True, ""
+    except Exception as e:
+        _time_synced = False
+        _time_sync_error = str(e)
+        return False, _time_sync_error
+
+
 def is_quiet_now():
     if not QUIET_ENABLE:
         return False
-    hour = time.localtime()[3]
+    lt, synced = localtime_now()
+    if (not synced) and (not TIME_UNSYNC_FAILSAFE_QUIET):
+        return False
+    if not lt:
+        return False
+    hour = lt[3]
     if QUIET_START_H < QUIET_END_H:
         return QUIET_START_H <= hour < QUIET_END_H
     return (hour >= QUIET_START_H) or (hour < QUIET_END_H)
@@ -382,6 +491,8 @@ def wifi_connect(timeout_ms=15000, attempts=3):
 
 _last_tg_send = 0
 _last_update_id = 0
+_time_synced = False
+_time_sync_error = "not synced"
 
 
 def safe_close(r):
@@ -600,11 +711,18 @@ def render_status_card(co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok, wa
 
 
 def render_details_card(co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f, sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, warn_on, high_on):
+    global _time_synced, _time_sync_error
     lvl = "-" if co2_f is None else quality_label(co2_f, warn_on, high_on)
     quiet_now = "YES" if is_quiet_now() else "NO"
+    lt, _ = localtime_now()
+    local_time_txt = _format_local_time(lt)
+    sync_txt = "OK" if _time_synced else "ERR"
+    sync_err = "-" if _time_synced else (_time_sync_error or "-")
     return (
         "🔎 System Details\n"
         "Wi-Fi: {} | Sensor: {}\n"
+        "Local time: {} | Time sync: {}\n"
+        "Time sync error: {}\n"
         "Level: {}\n"
         "Raw: CO2 {} | T {} C | RH {} %\n"
         "Filtered: CO2 {} | T {} C | RH {} %\n"
@@ -616,6 +734,9 @@ def render_details_card(co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f, sample_a
     ).format(
         "OK" if wifi_ok else "ERR",
         "OK" if sensor_ok else "ERR",
+        local_time_txt,
+        sync_txt,
+        sync_err,
         lvl,
         _fmt_int(co2_raw),
         "-" if temp_raw is None else "{:.2f}".format(temp_raw),
@@ -667,7 +788,8 @@ def render_help_card():
         "Inline buttons are disabled.\n"
         "Commands: /menu /status /info /thresholds /settings /help\n"
         "/thresholds -> WARN/HIGH\n"
-        "/settings -> WARN/HIGH/REM"
+        "/settings -> WARN/HIGH/REM\n"
+        "Quiet mode follows local synced time."
     )
 
 
@@ -919,42 +1041,60 @@ def tg_poll_commands(
                 co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f,
                 sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state
             )
-            tg_send(txt, reply_markup=kb)
+            if TG_INLINE_KEYBOARD_ENABLE:
+                tg_send(txt, reply_markup=kb)
+            else:
+                tg_send(txt)
         elif cmd == "status":
             txt, kb = render_menu_section(
                 "status",
                 co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f,
                 sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state
             )
-            tg_send(txt, reply_markup=kb)
+            if TG_INLINE_KEYBOARD_ENABLE:
+                tg_send(txt, reply_markup=kb)
+            else:
+                tg_send(txt)
         elif cmd == "info":
             txt, kb = render_menu_section(
                 "details",
                 co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f,
                 sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state
             )
-            tg_send(txt, reply_markup=kb)
+            if TG_INLINE_KEYBOARD_ENABLE:
+                tg_send(txt, reply_markup=kb)
+            else:
+                tg_send(txt)
         elif cmd == "settings":
             txt, kb = render_menu_section(
                 "settings",
                 co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f,
                 sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state
             )
-            tg_send(txt, reply_markup=kb)
+            if TG_INLINE_KEYBOARD_ENABLE:
+                tg_send(txt, reply_markup=kb)
+            else:
+                tg_send(txt)
         elif cmd == "thresholds":
             txt, kb = render_menu_section(
                 "thresholds",
                 co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f,
                 sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state
             )
-            tg_send(txt, reply_markup=kb)
+            if TG_INLINE_KEYBOARD_ENABLE:
+                tg_send(txt, reply_markup=kb)
+            else:
+                tg_send(txt)
         elif cmd == "help":
             txt, kb = render_menu_section(
                 "help",
                 co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f,
                 sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state
             )
-            tg_send(txt, reply_markup=kb)
+            if TG_INLINE_KEYBOARD_ENABLE:
+                tg_send(txt, reply_markup=kb)
+            else:
+                tg_send(txt)
 
     return state["warn_on"], state["high_on"], state["remind_min"]
 
@@ -1180,6 +1320,22 @@ def main():
 
     wlan = wifi_connect()
     print("WiFi connected:", wlan.isconnected())
+    time_synced = False
+    last_time_sync_ms = time.ticks_ms()
+    time_sync_error = "not synced"
+    local_hour_cached = -1
+    time_sync_interval_ms = TIME_SYNC_EVERY_HOURS * 60 * 60 * 1000
+    if TIME_SYNC_ENABLE and wlan.isconnected():
+        ok, err = sync_time_ntp()
+        time_synced = ok
+        time_sync_error = err
+        last_time_sync_ms = time.ticks_ms()
+    lt_boot, synced_boot = localtime_now()
+    if lt_boot:
+        local_hour_cached = lt_boot[3]
+    print("Time sync:", "OK" if time_synced else "ERR", ("" if time_synced else time_sync_error))
+    print("Local time:", _format_local_time(lt_boot), "synced:", "YES" if synced_boot else "NO")
+    print("Quiet window: {:02d}:00-{:02d}:00".format(QUIET_START_H, QUIET_END_H))
 
     i2c_scd = I2C(0, sda=Pin(SCD_SDA), scl=Pin(SCD_SCL), freq=SCD_I2C_FREQ)
     scd_scan = [hex(x) for x in i2c_scd.scan()]
@@ -1380,7 +1536,16 @@ def main():
         if time.ticks_diff(now, last_ready_log) >= READY_LOG_EVERY_MS:
             last_ready_log = now
             age = "-" if last_sample_ms is None else str(time.ticks_diff(now, last_sample_ms) // 1000)
-            print("ready_raw:", ready_raw, "sample_age_s:", age)
+            lt_dbg, synced_dbg = localtime_now()
+            local_hour_cached = lt_dbg[3] if lt_dbg else -1
+            if not synced_dbg:
+                time_synced = False
+            print(
+                "ready_raw:", ready_raw,
+                "sample_age_s:", age,
+                "local_hour:", local_hour_cached,
+                "time_synced:", "YES" if time_synced else "NO"
+            )
 
         if time.ticks_diff(now, last_wifi) > WIFI_RECONNECT_MS:
             last_wifi = now
@@ -1388,6 +1553,25 @@ def main():
                 wlan = wifi_connect()
                 if wlan.isconnected():
                     print("WiFi reconnected")
+                    if TIME_SYNC_ENABLE:
+                        ok, err = sync_time_ntp()
+                        time_synced = ok
+                        time_sync_error = err
+                        last_time_sync_ms = now
+                        lt_sync, synced_sync = localtime_now()
+                        local_hour_cached = lt_sync[3] if lt_sync else -1
+                        print("Time sync:", "OK" if time_synced else "ERR", ("" if time_synced else time_sync_error))
+                        print("Local time:", _format_local_time(lt_sync), "synced:", "YES" if synced_sync else "NO")
+
+        if TIME_SYNC_ENABLE and wlan.isconnected() and time.ticks_diff(now, last_time_sync_ms) >= time_sync_interval_ms:
+            ok, err = sync_time_ntp()
+            time_synced = ok
+            time_sync_error = err
+            last_time_sync_ms = now
+            lt_sync, synced_sync = localtime_now()
+            local_hour_cached = lt_sync[3] if lt_sync else -1
+            print("Periodic time sync:", "OK" if time_synced else "ERR", ("" if time_synced else time_sync_error))
+            print("Local time:", _format_local_time(lt_sync), "synced:", "YES" if synced_sync else "NO")
 
         if wlan.isconnected() and TG_CMDS_ENABLE and time.ticks_diff(now, last_cmd) > TG_CMD_POLL_MS:
             last_cmd = now
