@@ -106,21 +106,29 @@ mpremote connect /dev/cu.usbmodemXXXX run oled_scd41_test.py
 
 ## Telegram commands
 
-- `/status` — compact live status
-- `/info` — extended status (raw/filtered values, uptime, thresholds, reminder)
-- `/settings` — open threshold/reminder control
-- `/thresholds` — alias of `/settings`
-- `/help` — command list
+- `/menu` — main entrypoint (Home with inline sections)
+- `/status` — compact status view (alias)
+- `/info` — details/diagnostics view (alias)
+- `/settings` — full settings view (WARN/HIGH/REM)
+- `/thresholds` — thresholds-only view (WARN/HIGH)
+- `/help` — help view (alias)
 
-### Inline settings buttons
+### Menu sections (inline)
+
+- `Status` — compact daily metrics
+- `Details` — extended diagnostics (raw/filtered, uptime, scans)
+- `Controls` — quick actions (`Preset Home`)
+- `Settings` — WARN/HIGH/REM tuning
+- `Help` — command overview
+
+### Settings buttons
 
 - `WARN -50 / +50`
 - `HIGH -50 / +50`
 - `REM -5 / +5` (minutes)
 - `Preset Home` (`WARN=800`, `HIGH=1500`, `REM=20`)
-- `Preset Office` (`WARN=900`, `HIGH=1400`, `REM=15`)
 
-All changes are validated and saved to `state.json`, so they survive reboot.
+All settings changes are validated and saved to `state.json`, so they survive reboot.
 
 ## Notes
 
