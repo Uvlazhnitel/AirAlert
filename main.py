@@ -12,7 +12,25 @@ from config import *
 from state_store import apply_state_defaults, load_state
 from display_ui import draw_screen, draw_stale, draw_warmup, trend_from_delta
 from sensor_i2c import SCD41, create_scd_i2c, scan_hex, get_oled_probe, recover_shared_i2c
-from diagnostics import diag_init, diag_mark_i2c_err, diag_mark_recover, diag_compute
+from diagnostics import (
+    diag_init,
+    diag_mark_i2c_err,
+    diag_mark_recover,
+    diag_compute,
+    diag_record_event,
+    diag_get_recent_events,
+    diag_note_time_sync,
+    diag_note_wifi_reconnect,
+    diag_note_tg_send_error,
+    diag_allow_scd_restart,
+    ERR_SENSOR_READ,
+    ERR_OLED_INIT,
+    ERR_I2C_RECOVER,
+    ERR_TG_SEND,
+    ERR_TIME_SYNC,
+    ERR_WIFI_RECONNECT,
+    WARN_SCD_RESTART_LIMIT,
+)
 from telegram_bot import (
     tg_send_alert,
     render_alert_high,
@@ -23,6 +41,41 @@ from telegram_bot import (
 
 def ema(prev, x, alpha):
     return x if prev is None else (prev + alpha * (x - prev))
+
+
+def log_line(level, code, message):
+    print("LOG", level, code, message)
+
+
+def ensure_health_snapshot(snapshot):
+    base = {
+        "power_bad": False,
+        "score": 0,
+        "err_rate_per_min": 0.0,
+        "i2c_err_total": 0,
+        "recover_total": 0,
+        "sensor_err_total": 0,
+        "oled_init_err_total": 0,
+        "last_recover_age_s": "-",
+        "time_synced": False,
+        "bus_mode": "SEPARATE",
+        "bus_freq_hz": SCD_I2C_FREQ,
+        "window_ms": PWR_DIAG_WINDOW_MS,
+        "mode": "NORMAL",
+        "last_power_bad_age_s": "-",
+        "last_i2c_err_age_s": "-",
+        "wifi_reconnect_total": 0,
+        "time_sync_last_ok_age_s": "-",
+        "tg_send_err_total": 0,
+        "recent_events": [],
+        "recent_events_all": [],
+    }
+    if not isinstance(snapshot, dict):
+        return base
+    for k, v in base.items():
+        if k not in snapshot:
+            snapshot[k] = v
+    return snapshot
 
 
 def level_from_co2(co2, warn_on, high_on):
@@ -194,16 +247,16 @@ _time_sync_error = "not synced"
 # ===================== UI helpers =====================
 # ===================== Main =====================
 def main():
-    print("=== CO2 OLED Monitor ===")
+    log_line("INFO", "BOOT", "=== CO2 OLED Monitor ===")
     boot_ms = time.ticks_ms()
-    diag = diag_init(boot_ms)
+    diag = diag_init(boot_ms, max_events=EVENT_RECORDER_MAX)
 
     state = apply_state_defaults(load_state())
     warn_on = int(state["warn_on"])
     high_on = int(state["high_on"])
     remind_min = int(state["remind_min"])
     remind_ms = remind_min * 60 * 1000
-    print("Runtime settings: WARN", warn_on, "HIGH", high_on, "REM", remind_min, "min")
+    log_line("INFO", "CFG", "WARN {} HIGH {} REM {} min".format(warn_on, high_on, remind_min))
 
     try:
         socket.setdefaulttimeout(TG_TIMEOUT_S)
@@ -211,7 +264,7 @@ def main():
         pass
 
     wlan = wifi_connect()
-    print("WiFi connected:", wlan.isconnected())
+    log_line("INFO", "WIFI", "connected={}".format(wlan.isconnected()))
     time_synced = False
     last_time_sync_ms = time.ticks_ms()
     time_sync_error = "not synced"
@@ -219,24 +272,27 @@ def main():
     time_sync_interval_ms = TIME_SYNC_EVERY_HOURS * 60 * 60 * 1000
     if TIME_SYNC_ENABLE and wlan.isconnected():
         ok, err = sync_time_ntp()
+        diag_note_time_sync(diag, time.ticks_ms(), ok)
+        if not ok:
+            diag_record_event(diag, time.ticks_ms(), ERR_TIME_SYNC, "time sync failed", err, level="WARN")
         time_synced = ok
         time_sync_error = err
         last_time_sync_ms = time.ticks_ms()
     lt_boot, synced_boot = localtime_now()
     if lt_boot:
         local_hour_cached = lt_boot[3]
-    print("Time sync:", "OK" if time_synced else "ERR", ("" if time_synced else time_sync_error))
-    print("Local time:", _format_local_time(lt_boot), "synced:", "YES" if synced_boot else "NO")
-    print("Quiet window: {:02d}:00-{:02d}:00".format(QUIET_START_H, QUIET_END_H))
+    log_line("INFO", "TIME_SYNC", "{} {}".format("OK" if time_synced else "ERR", ("" if time_synced else time_sync_error)))
+    log_line("INFO", "LOCAL_TIME", "{} synced={}".format(_format_local_time(lt_boot), "YES" if synced_boot else "NO"))
+    log_line("INFO", "QUIET", "{:02d}:00-{:02d}:00".format(QUIET_START_H, QUIET_END_H))
 
     i2c_scd = create_scd_i2c()
     scd_scan = scan_hex(i2c_scd)
-    print("SCD I2C scan:", scd_scan)
+    log_line("INFO", "I2C_SCAN_SCD", str(scd_scan))
     if SHARED_I2C_BUS:
-        print("I2C mode: shared bus for SCD41+OLED on GPIO{},GPIO{}".format(SCD_SDA, SCD_SCL))
+        log_line("INFO", "I2C_MODE", "shared bus GPIO{},GPIO{}".format(SCD_SDA, SCD_SCL))
 
     if SCD4X_ADDR not in i2c_scd.scan():
-        print("SCD41 not found")
+        log_line("ERR", "SCD_NOT_FOUND", "SCD41 not found")
         return
 
     scd = SCD41(i2c_scd)
@@ -334,6 +390,7 @@ def main():
     stale_ui = False
     warmup_drawn = False
     last_pwr_diag_log = time.ticks_add(time.ticks_ms(), -PWR_DIAG_LOG_EVERY_MS)
+    last_scd_restart_limit_log = time.ticks_add(time.ticks_ms(), -PWR_DIAG_LOG_EVERY_MS)
     health_snapshot = {
         "power_bad": False,
         "score": 0,
@@ -347,6 +404,14 @@ def main():
         "bus_mode": "SHARED" if SHARED_I2C_BUS else "SEPARATE",
         "bus_freq_hz": SHARED_I2C_FREQ if SHARED_I2C_BUS else SCD_I2C_FREQ,
         "window_ms": PWR_DIAG_WINDOW_MS,
+        "mode": "NORMAL",
+        "last_power_bad_age_s": "-",
+        "last_i2c_err_age_s": "-",
+        "wifi_reconnect_total": 0,
+        "time_sync_last_ok_age_s": "-",
+        "tg_send_err_total": 0,
+        "recent_events": [],
+        "recent_events_all": [],
     }
 
     while True:
@@ -378,14 +443,17 @@ def main():
             except Exception as e:
                 print("OLED init error:", e)
                 diag["diag_oled_init_err_total"] += 1
+                diag_record_event(diag, now, ERR_OLED_INIT, "oled init failed", str(e), level="ERR")
                 diag_mark_i2c_err(diag, now, "oled", PWR_DIAG_I2C_ERR_WEIGHT)
                 try:
                     i2c_scd, last_i2c_recover, recovered = recover_shared_i2c(now, last_i2c_recover, scd)
                     if recovered:
                         oled_ok = False
                         diag_mark_recover(diag, now, PWR_DIAG_RECOVER_SCORE_WEIGHT)
+                        diag_record_event(diag, now, ERR_I2C_RECOVER, "shared bus recover after oled")
                         print("I2C recover: shared bus reinit after OLED error")
                 except Exception as e2:
+                    diag_record_event(diag, now, ERR_I2C_RECOVER, "shared bus recover failed", str(e2), level="WARN")
                     print("I2C recover error:", e2)
 
         if time.ticks_diff(now, last_ready_poll) >= READY_POLL_MS:
@@ -438,6 +506,9 @@ def main():
                                 ):
                                     print("TG alert: HIGH sent")
                                     last_remind = now
+                                else:
+                                    diag_note_tg_send_error(diag)
+                                    diag_record_event(diag, now, ERR_TG_SEND, "high alert send failed", level="WARN")
                         elif (lvl == LVL_HIGH) and (time.ticks_diff(now, last_remind) > remind_ms):
                             if not is_quiet_now():
                                 if tg_send_alert(
@@ -445,23 +516,32 @@ def main():
                                 ):
                                     print("TG alert: HIGH reminder sent")
                                     last_remind = now
+                                else:
+                                    diag_note_tg_send_error(diag)
+                                    diag_record_event(diag, now, ERR_TG_SEND, "reminder send failed", level="WARN")
                         elif (prev_lvl == LVL_HIGH) and (lvl == LVL_GOOD):
                             if tg_send_alert(
                                 render_alert_recovery(co2_for_alert, temp_for_alert, rh_for_alert)
                             ):
                                 print("TG alert: GOOD sent")
+                            else:
+                                diag_note_tg_send_error(diag)
+                                diag_record_event(diag, now, ERR_TG_SEND, "recovery send failed", level="WARN")
                     prev_lvl = lvl
             except Exception as e:
                 print("Sensor read error:", e)
                 diag["diag_sensor_err_total"] += 1
+                diag_record_event(diag, now, ERR_SENSOR_READ, "sensor read failed", str(e), level="ERR")
                 diag_mark_i2c_err(diag, now, "sensor", PWR_DIAG_I2C_ERR_WEIGHT)
                 try:
                     i2c_scd, last_i2c_recover, recovered = recover_shared_i2c(now, last_i2c_recover, scd)
                     if recovered:
                         oled_ok = False
                         diag_mark_recover(diag, now, PWR_DIAG_RECOVER_SCORE_WEIGHT)
+                        diag_record_event(diag, now, ERR_I2C_RECOVER, "shared bus recover after sensor")
                         print("I2C recover: shared bus reinit after sensor error")
                 except Exception as e2:
+                    diag_record_event(diag, now, ERR_I2C_RECOVER, "shared bus recover failed", str(e2), level="WARN")
                     print("I2C recover error:", e2)
 
         prev_power_bad = diag.get("power_bad", False)
@@ -476,6 +556,7 @@ def main():
         )
         if comp["power_bad"] and (not prev_power_bad):
             diag["diag_last_power_bad_ms"] = now
+            diag_record_event(diag, now, "WARN_POWER_BAD", "power quality degraded", "score={}".format(comp["score"]), level="WARN")
         if time.ticks_diff(now, last_pwr_diag_log) >= PWR_DIAG_LOG_EVERY_MS:
             last_pwr_diag_log = now
             print(
@@ -489,6 +570,16 @@ def main():
         last_recover_age_s = "-"
         if diag["diag_last_recover_ms"] is not None:
             last_recover_age_s = str(max(0, time.ticks_diff(now, diag["diag_last_recover_ms"]) // 1000))
+        last_power_bad_age_s = "-"
+        if diag["diag_last_power_bad_ms"] is not None:
+            last_power_bad_age_s = str(max(0, time.ticks_diff(now, diag["diag_last_power_bad_ms"]) // 1000))
+        last_i2c_err_age_s = "-"
+        if diag["diag_last_i2c_err_ms"] is not None:
+            last_i2c_err_age_s = str(max(0, time.ticks_diff(now, diag["diag_last_i2c_err_ms"]) // 1000))
+        time_sync_last_ok_age_s = "-"
+        if diag["diag_last_time_sync_ok_ms"] is not None:
+            time_sync_last_ok_age_s = str(max(0, time.ticks_diff(now, diag["diag_last_time_sync_ok_ms"]) // 1000))
+        mode = "DEGRADED" if diag.get("runtime_degraded") else "NORMAL"
         health_snapshot = {
             "power_bad": comp["power_bad"],
             "score": comp["score"],
@@ -502,7 +593,16 @@ def main():
             "bus_mode": "SHARED" if SHARED_I2C_BUS else "SEPARATE",
             "bus_freq_hz": SHARED_I2C_FREQ if SHARED_I2C_BUS else SCD_I2C_FREQ,
             "window_ms": PWR_DIAG_WINDOW_MS,
+            "mode": mode,
+            "last_power_bad_age_s": last_power_bad_age_s,
+            "last_i2c_err_age_s": last_i2c_err_age_s,
+            "wifi_reconnect_total": diag["diag_wifi_reconnect_total"],
+            "time_sync_last_ok_age_s": time_sync_last_ok_age_s,
+            "tg_send_err_total": diag["diag_tg_send_err_total"],
+            "recent_events": diag_get_recent_events(diag, DIAG_CMD_EVENTS_LIMIT),
+            "recent_events_all": diag_get_recent_events(diag, EVENTS_CMD_LIMIT),
         }
+        health_snapshot = ensure_health_snapshot(health_snapshot)
 
         if time.ticks_diff(now, last_ready_log) >= READY_LOG_EVERY_MS:
             last_ready_log = now
@@ -523,9 +623,14 @@ def main():
             if not wlan.isconnected():
                 wlan = wifi_connect()
                 if wlan.isconnected():
+                    diag_note_wifi_reconnect(diag)
+                    diag_record_event(diag, now, ERR_WIFI_RECONNECT, "wifi reconnected", level="INFO")
                     print("WiFi reconnected")
                     if TIME_SYNC_ENABLE:
                         ok, err = sync_time_ntp()
+                        diag_note_time_sync(diag, now, ok)
+                        if not ok:
+                            diag_record_event(diag, now, ERR_TIME_SYNC, "time sync failed", err, level="WARN")
                         time_synced = ok
                         time_sync_error = err
                         last_time_sync_ms = now
@@ -536,6 +641,9 @@ def main():
 
         if TIME_SYNC_ENABLE and wlan.isconnected() and time.ticks_diff(now, last_time_sync_ms) >= time_sync_interval_ms:
             ok, err = sync_time_ntp()
+            diag_note_time_sync(diag, now, ok)
+            if not ok:
+                diag_record_event(diag, now, ERR_TIME_SYNC, "periodic time sync failed", err, level="WARN")
             time_synced = ok
             time_sync_error = err
             last_time_sync_ms = now
@@ -587,6 +695,21 @@ def main():
 
         if (co2 is None) or (last_sample_ms is None) or stale_sensor:
             if time.ticks_diff(now, last_restart) >= SCD_RESTART_MS:
+                allowed_restart, restart_count = diag_allow_scd_restart(
+                    diag, now, SCD_RECOVERY_WINDOW_MS, SCD_RECOVERY_MAX_ATTEMPTS
+                )
+                if not allowed_restart:
+                    diag["runtime_degraded"] = True
+                    if time.ticks_diff(now, last_scd_restart_limit_log) >= PWR_DIAG_LOG_EVERY_MS:
+                        last_scd_restart_limit_log = now
+                        diag_record_event(
+                            diag, now, WARN_SCD_RESTART_LIMIT,
+                            "scd restart skipped (limit)",
+                            "count={}".format(restart_count), level="WARN"
+                        )
+                        log_line("WARN", WARN_SCD_RESTART_LIMIT, "restart skipped count={}".format(restart_count))
+                    time.sleep_ms(50)
+                    continue
                 print("Restarting SCD41 measurement (no data/stale)")
                 try:
                     scd.stop_periodic_measurement()

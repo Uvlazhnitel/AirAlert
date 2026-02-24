@@ -54,10 +54,19 @@ The project is split into modules:
   - trend helpers and screen drawing
 
 - `telegram_bot.py`
-  - Telegram transport (`sendMessage`, polling)
-  - command routing
-  - command text renderers
-  - alert text templates
+  - compatibility facade for Telegram API used by `main.py`
+
+- `telegram_transport.py`
+  - Telegram transport (`sendMessage`, polling, callback answers)
+  - update/chat routing helpers
+
+- `telegram_render.py`
+  - message/card rendering (`/status`, `/info`, `/health`, `/diag`, `/events`)
+  - alert templates and inline keyboard builders
+
+- `telegram_commands.py`
+  - command routing and callback handling
+  - settings/threshold callback apply logic
 
 - `sh1106.py`
   - OLED driver dependency
@@ -121,6 +130,8 @@ Notes:
 - `/status` - compact status
 - `/info` - full diagnostics
 - `/health` - power diagnostics and bus/runtime health
+- `/diag` - compact operational snapshot
+- `/events` - recent runtime event log
 - `/thresholds` - WARN/HIGH view
 - `/settings` - WARN/HIGH/REM view
 - `/help` - command help
@@ -179,6 +190,10 @@ mpremote connect /dev/cu.usbmodemXXXX fs cp /Users/uvlazhnitel/Documents/coding/
 mpremote connect /dev/cu.usbmodemXXXX fs cp /Users/uvlazhnitel/Documents/coding/esp32/sensor_i2c.py :sensor_i2c.py
 mpremote connect /dev/cu.usbmodemXXXX fs cp /Users/uvlazhnitel/Documents/coding/esp32/display_ui.py :display_ui.py
 mpremote connect /dev/cu.usbmodemXXXX fs cp /Users/uvlazhnitel/Documents/coding/esp32/telegram_bot.py :telegram_bot.py
+mpremote connect /dev/cu.usbmodemXXXX fs cp /Users/uvlazhnitel/Documents/coding/esp32/telegram_transport.py :telegram_transport.py
+mpremote connect /dev/cu.usbmodemXXXX fs cp /Users/uvlazhnitel/Documents/coding/esp32/telegram_render.py :telegram_render.py
+mpremote connect /dev/cu.usbmodemXXXX fs cp /Users/uvlazhnitel/Documents/coding/esp32/telegram_commands.py :telegram_commands.py
+mpremote connect /dev/cu.usbmodemXXXX fs cp /Users/uvlazhnitel/Documents/coding/esp32/diagnostics.py :diagnostics.py
 mpremote connect /dev/cu.usbmodemXXXX fs cp /Users/uvlazhnitel/Documents/coding/esp32/sh1106.py :sh1106.py
 mpremote connect /dev/cu.usbmodemXXXX fs cp /Users/uvlazhnitel/Documents/coding/esp32/secrets.py :secrets.py
 ```
