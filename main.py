@@ -27,10 +27,13 @@ except ImportError:
 SCD4X_ADDR = 0x62
 OLED_ADDR = 0x3C
 
-SCD_SDA = 3
+SCD_SDA = 8
 SCD_SCL = 9
-OLED_SDA = 13
-OLED_SCL = 12
+OLED_SDA = 8
+OLED_SCL = 9
+SHARED_I2C_BUS = (SCD_SDA == OLED_SDA) and (SCD_SCL == OLED_SCL)
+SHARED_I2C_FREQ = 20_000
+I2C_RECOVERY_COOLDOWN_MS = 2500
 
 W = 128
 H = 64
@@ -40,12 +43,14 @@ SCD_I2C_FREQ = 50_000
 OLED_I2C_FREQ = 100_000
 
 # Accuracy/config per SCD41 datasheet
-ASC_ENABLED = False
-ASC_TARGET_PPM = None          # e.g. 420, None = keep default target
-AMBIENT_PRESSURE_PA = None     # e.g. 101300, overrides altitude if set
+# Max-accuracy profile defaults: keep ASC enabled and target fresh-air baseline.
+ASC_ENABLED = True
+ASC_TARGET_PPM = 420           # None = keep sensor default target
+AMBIENT_PRESSURE_PA = 101000
 ALTITUDE_M = 0                 # used when AMBIENT_PRESSURE_PA is None
-TEMP_OFFSET_C = None           # internal SCD temp offset (0..20C), None = keep default
+TEMP_OFFSET_C = getattr(secrets, "TEMP_OFFSET_C", None) if secrets else None  # internal SCD temp offset (0..20C)
 PERSIST_SETTINGS = False       # write settings to sensor EEPROM (use sparingly)
+ALERT_USE_RAW_CO2 = True       # raw CO2 for threshold logic/alerts, EMA remains for UI
 
 # Display correction only (does not affect sensor math)
 TEMP_CORR_C = 1.9
@@ -90,6 +95,7 @@ TG_CMDS_ENABLE = True
 TG_CMD_POLL_MS = 8000
 TG_GETUPDATES_LIMIT = 10
 TG_INLINE_KEYBOARD_ENABLE = False
+TG_TEXT_MAX_LEN = 3800
 
 # Time sync / timezone (Riga default)
 TIME_SYNC_ENABLE = True
@@ -493,6 +499,7 @@ _last_tg_send = 0
 _last_update_id = 0
 _time_synced = False
 _time_sync_error = "not synced"
+_last_tg_chat_id = 0
 
 
 def safe_close(r):
@@ -503,31 +510,85 @@ def safe_close(r):
         pass
 
 
-def tg_send(text, reply_markup=None):
+def tg_send(text, reply_markup=None, chat_id=None):
     global _last_tg_send
+    global _last_tg_chat_id
 
-    if (not TG_ENABLE) or (not TG_TOKEN) or (TG_CHAT_ID == 0):
+    target_chat_id = chat_id
+    if target_chat_id is None:
+        target_chat_id = _last_tg_chat_id if _last_tg_chat_id else TG_CHAT_ID
+    try:
+        target_chat_id_txt = str(int(target_chat_id))
+    except Exception:
+        target_chat_id_txt = str(target_chat_id)
+    if (not TG_ENABLE) or (not TG_TOKEN) or (target_chat_id == 0):
         return False
     if requests is None:
         return False
 
     now = time.ticks_ms()
-    if time.ticks_diff(now, _last_tg_send) < TG_MIN_GAP_MS:
-        return False
+    gap = time.ticks_diff(now, _last_tg_send)
+    if gap < TG_MIN_GAP_MS:
+        time.sleep_ms(TG_MIN_GAP_MS - gap)
+        now = time.ticks_ms()
+
+    if text is None:
+        text = ""
+    try:
+        text = str(text)
+    except Exception:
+        text = "<text error>"
+    if len(text) > TG_TEXT_MAX_LEN:
+        text = text[:TG_TEXT_MAX_LEN - 12] + "\n...truncated"
 
     r = None
     try:
+        token_tail = "none"
+        try:
+            token_tail = TG_TOKEN[-6:] if TG_TOKEN else "none"
+        except Exception:
+            pass
         if not TG_INLINE_KEYBOARD_ENABLE:
             reply_markup = None
-        payload = {"chat_id": TG_CHAT_ID, "text": text}
+        form = "chat_id={}&text={}".format(
+            url_escape(target_chat_id_txt),
+            url_escape(text),
+        )
         if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
-        data = json.dumps(payload)
+            try:
+                rm = json.dumps(reply_markup)
+                form += "&reply_markup={}".format(url_escape(rm))
+            except Exception:
+                pass
         url = "https://api.telegram.org/bot{}/sendMessage".format(TG_TOKEN)
-        r = requests.post(url, data=data, headers={"Content-Type": "application/json"})
+        r = requests.post(
+            url,
+            data=form,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
         code = getattr(r, "status_code", None)
         if code is not None and code != 200:
-            print("TG HTTP:", code)
+            desc = "-"
+            body = "-"
+            try:
+                j = r.json()
+                if j:
+                    desc = j.get("description", "-")
+            except Exception:
+                pass
+            try:
+                body = r.text
+            except Exception:
+                pass
+            if isinstance(body, str) and len(body) > 180:
+                body = body[:180] + "..."
+            print(
+                "TG HTTP:", code,
+                "chat_id:", target_chat_id_txt,
+                "token_tail:", token_tail,
+                "desc:", desc,
+                "body:", body
+            )
             return False
         resp = None
         try:
@@ -543,6 +604,7 @@ def tg_send(text, reply_markup=None):
             print("TG send failed:", desc)
             return False
         _last_tg_send = now
+        _last_tg_chat_id = target_chat_id
         return True
     except Exception as e:
         print("TG send error:", e)
@@ -946,6 +1008,7 @@ def tg_poll_commands(
     sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state
 ):
     global _last_update_id
+    global _last_tg_chat_id
 
     if (not TG_CMDS_ENABLE) or (not TG_ENABLE) or (not TG_TOKEN) or (requests is None):
         return state["warn_on"], state["high_on"], state["remind_min"]
@@ -1017,6 +1080,9 @@ def tg_poll_commands(
         if not msg:
             continue
 
+        chat_id = (msg.get("chat") or {}).get("id", TG_CHAT_ID)
+        if chat_id:
+            _last_tg_chat_id = chat_id
         from_id = (msg.get("from") or {}).get("id")
         if TG_ALLOWED_USER_ID and from_id != TG_ALLOWED_USER_ID:
             print("TG unauthorized user:", from_id)
@@ -1034,6 +1100,7 @@ def tg_poll_commands(
             cmd = cmd.split("@", 1)[0]
 
         print("TG cmd: /" + cmd)
+        print("TG route from_id:", from_id, "chat_id:", chat_id)
 
         if cmd == "menu":
             txt, kb = render_menu_section(
@@ -1042,9 +1109,9 @@ def tg_poll_commands(
                 sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state
             )
             if TG_INLINE_KEYBOARD_ENABLE:
-                tg_send(txt, reply_markup=kb)
+                tg_send(txt, reply_markup=kb, chat_id=chat_id)
             else:
-                tg_send(txt)
+                tg_send(txt, chat_id=chat_id)
         elif cmd == "status":
             txt, kb = render_menu_section(
                 "status",
@@ -1052,9 +1119,9 @@ def tg_poll_commands(
                 sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state
             )
             if TG_INLINE_KEYBOARD_ENABLE:
-                tg_send(txt, reply_markup=kb)
+                tg_send(txt, reply_markup=kb, chat_id=chat_id)
             else:
-                tg_send(txt)
+                tg_send(txt, chat_id=chat_id)
         elif cmd == "info":
             txt, kb = render_menu_section(
                 "details",
@@ -1062,9 +1129,9 @@ def tg_poll_commands(
                 sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state
             )
             if TG_INLINE_KEYBOARD_ENABLE:
-                tg_send(txt, reply_markup=kb)
+                tg_send(txt, reply_markup=kb, chat_id=chat_id)
             else:
-                tg_send(txt)
+                tg_send(txt, chat_id=chat_id)
         elif cmd == "settings":
             txt, kb = render_menu_section(
                 "settings",
@@ -1072,9 +1139,9 @@ def tg_poll_commands(
                 sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state
             )
             if TG_INLINE_KEYBOARD_ENABLE:
-                tg_send(txt, reply_markup=kb)
+                tg_send(txt, reply_markup=kb, chat_id=chat_id)
             else:
-                tg_send(txt)
+                tg_send(txt, chat_id=chat_id)
         elif cmd == "thresholds":
             txt, kb = render_menu_section(
                 "thresholds",
@@ -1082,9 +1149,9 @@ def tg_poll_commands(
                 sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state
             )
             if TG_INLINE_KEYBOARD_ENABLE:
-                tg_send(txt, reply_markup=kb)
+                tg_send(txt, reply_markup=kb, chat_id=chat_id)
             else:
-                tg_send(txt)
+                tg_send(txt, chat_id=chat_id)
         elif cmd == "help":
             txt, kb = render_menu_section(
                 "help",
@@ -1092,9 +1159,9 @@ def tg_poll_commands(
                 sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state
             )
             if TG_INLINE_KEYBOARD_ENABLE:
-                tg_send(txt, reply_markup=kb)
+                tg_send(txt, reply_markup=kb, chat_id=chat_id)
             else:
-                tg_send(txt)
+                tg_send(txt, chat_id=chat_id)
 
     return state["warn_on"], state["high_on"], state["remind_min"]
 
@@ -1337,9 +1404,12 @@ def main():
     print("Local time:", _format_local_time(lt_boot), "synced:", "YES" if synced_boot else "NO")
     print("Quiet window: {:02d}:00-{:02d}:00".format(QUIET_START_H, QUIET_END_H))
 
-    i2c_scd = I2C(0, sda=Pin(SCD_SDA), scl=Pin(SCD_SCL), freq=SCD_I2C_FREQ)
+    scd_i2c_freq = SHARED_I2C_FREQ if SHARED_I2C_BUS else SCD_I2C_FREQ
+    i2c_scd = I2C(0, sda=Pin(SCD_SDA), scl=Pin(SCD_SCL), freq=scd_i2c_freq)
     scd_scan = [hex(x) for x in i2c_scd.scan()]
     print("SCD I2C scan:", scd_scan)
+    if SHARED_I2C_BUS:
+        print("I2C mode: shared bus for SCD41+OLED on GPIO{},GPIO{}".format(SCD_SDA, SCD_SCL))
 
     if SCD4X_ADDR not in i2c_scd.scan():
         print("SCD41 not found")
@@ -1429,6 +1499,7 @@ def main():
     oled_scan = "-"
     last_oled_init_try = time.ticks_add(time.ticks_ms(), -OLED_INIT_RETRY_MS)
     last_i2c_scan_log = time.ticks_add(time.ticks_ms(), -I2C_SCAN_LOG_EVERY_MS)
+    last_i2c_recover = time.ticks_add(time.ticks_ms(), -I2C_RECOVERY_COOLDOWN_MS)
     last_co2_for_trend = None
     last_temp_for_trend = None
     last_rh_for_trend = None
@@ -1445,10 +1516,16 @@ def main():
         if (not oled_ok) and (time.ticks_diff(now, last_oled_init_try) >= OLED_INIT_RETRY_MS):
             last_oled_init_try = now
             try:
-                i2c_oled = I2C(1, sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=OLED_I2C_FREQ)
-                scan = i2c_oled.scan()
-                oled_scan_list = [hex(x) for x in scan]
-                oled_scan = ",".join(oled_scan_list)
+                if SHARED_I2C_BUS:
+                    i2c_oled = i2c_scd
+                    scan = [OLED_ADDR]
+                    oled_scan_list = ["shared-bus"]
+                    oled_scan = "shared-bus"
+                else:
+                    i2c_oled = I2C(1, sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=OLED_I2C_FREQ)
+                    scan = i2c_oled.scan()
+                    oled_scan_list = [hex(x) for x in scan]
+                    oled_scan = ",".join(oled_scan_list)
                 log_scan_now = time.ticks_diff(now, last_i2c_scan_log) >= I2C_SCAN_LOG_EVERY_MS
                 if log_scan_now:
                     last_i2c_scan_log = now
@@ -1470,6 +1547,15 @@ def main():
                         print("OLED not found at 0x3C")
             except Exception as e:
                 print("OLED init error:", e)
+                if SHARED_I2C_BUS and time.ticks_diff(now, last_i2c_recover) >= I2C_RECOVERY_COOLDOWN_MS:
+                    last_i2c_recover = now
+                    try:
+                        i2c_scd = I2C(0, sda=Pin(SCD_SDA), scl=Pin(SCD_SCL), freq=SHARED_I2C_FREQ)
+                        scd.i2c = i2c_scd
+                        oled_ok = False
+                        print("I2C recover: shared bus reinit after OLED error")
+                    except Exception as e2:
+                        print("I2C recover error:", e2)
 
         if time.ticks_diff(now, last_ready_poll) >= READY_POLL_MS:
             last_ready_poll = now
@@ -1506,32 +1592,45 @@ def main():
                         co2, temp, rh, int(round(co2_f)), temp_f, rh_f
                     ))
 
-                    lvl = level_from_co2(co2_f, warn_on, high_on)
+                    co2_for_alert = co2 if ALERT_USE_RAW_CO2 else co2_f
+                    temp_for_alert = temp if temp is not None else temp_f
+                    rh_for_alert = rh if rh is not None else rh_f
+
+                    lvl = level_from_co2(co2_for_alert, warn_on, high_on)
                     if wlan.isconnected() and TG_ENABLE:
                         if (prev_lvl != LVL_HIGH) and (lvl == LVL_HIGH):
                             if is_quiet_now():
                                 print("TG quiet: HIGH muted")
                             else:
                                 if tg_send_alert(
-                                    render_alert_high(co2_f, temp_f, rh_f, reminder=False)
+                                    render_alert_high(co2_for_alert, temp_for_alert, rh_for_alert, reminder=False)
                                 ):
                                     print("TG alert: HIGH sent")
                                     last_remind = now
                         elif (lvl == LVL_HIGH) and (time.ticks_diff(now, last_remind) > remind_ms):
                             if not is_quiet_now():
                                 if tg_send_alert(
-                                    render_alert_high(co2_f, temp_f, rh_f, reminder=True)
+                                    render_alert_high(co2_for_alert, temp_for_alert, rh_for_alert, reminder=True)
                                 ):
                                     print("TG alert: HIGH reminder sent")
                                     last_remind = now
                         elif (prev_lvl == LVL_HIGH) and (lvl == LVL_GOOD):
                             if tg_send_alert(
-                                render_alert_recovery(co2_f, temp_f, rh_f)
+                                render_alert_recovery(co2_for_alert, temp_for_alert, rh_for_alert)
                             ):
                                 print("TG alert: GOOD sent")
                     prev_lvl = lvl
             except Exception as e:
                 print("Sensor read error:", e)
+                if SHARED_I2C_BUS and time.ticks_diff(now, last_i2c_recover) >= I2C_RECOVERY_COOLDOWN_MS:
+                    last_i2c_recover = now
+                    try:
+                        i2c_scd = I2C(0, sda=Pin(SCD_SDA), scl=Pin(SCD_SCL), freq=SHARED_I2C_FREQ)
+                        scd.i2c = i2c_scd
+                        oled_ok = False
+                        print("I2C recover: shared bus reinit after sensor error")
+                    except Exception as e2:
+                        print("I2C recover error:", e2)
 
         if time.ticks_diff(now, last_ready_log) >= READY_LOG_EVERY_MS:
             last_ready_log = now
