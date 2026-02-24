@@ -120,6 +120,7 @@ Notes:
 - `/menu` - command index
 - `/status` - compact status
 - `/info` - full diagnostics
+- `/health` - power diagnostics and bus/runtime health
 - `/thresholds` - WARN/HIGH view
 - `/settings` - WARN/HIGH/REM view
 - `/help` - command help

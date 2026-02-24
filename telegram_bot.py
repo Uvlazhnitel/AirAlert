@@ -384,7 +384,8 @@ def render_help_card():
     return (
         "ℹ️ Help\n"
         "Inline buttons are disabled.\n"
-        "Commands: /menu /status /info /thresholds /settings /help\n"
+        "Commands: /menu /status /info /health /thresholds /settings /help\n"
+        "/health -> power diagnostics\n"
         "/thresholds -> WARN/HIGH\n"
         "/settings -> WARN/HIGH/REM\n"
         "Quiet mode follows local synced time."
@@ -406,8 +407,62 @@ def render_menu_home_card(co2_f, temp_f, rh_f, sample_age_s, warn_on, high_on):
         "CO2: {} ppm ({})\n"
         "Temp: {} C | RH: {} %\n"
         "Sample age: {} s\n"
-        "Commands: /status /info /thresholds /settings /help"
+        "Commands: /status /info /health /thresholds /settings /help"
     ).format(_fmt_int(co2_f), lvl, _fmt_1(temp_f), _fmt_1(rh_f), sample_age_s)
+
+
+def _fmt_uptime_hhmmss(uptime_s):
+    try:
+        total = int(uptime_s)
+    except Exception:
+        return "-"
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return "{:02d}:{:02d}:{:02d}".format(h, m, s)
+
+
+def render_health_card(uptime_s, health):
+    power_txt = "BAD" if health.get("power_bad") else "GOOD"
+    score = int(health.get("score", 0))
+    try:
+        err_rate = float(health.get("err_rate_per_min", 0.0))
+    except Exception:
+        err_rate = 0.0
+    err_rate_txt = "{:.{p}f}".format(err_rate, p=HEALTH_ERR_RATE_DECIMALS)
+    last_recover_age = health.get("last_recover_age_s", "-")
+    if last_recover_age == "-":
+        last_recover_txt = "never"
+    else:
+        last_recover_txt = "{} s ago".format(last_recover_age)
+    time_synced_txt = "YES" if health.get("time_synced") else "NO"
+    bus_mode = health.get("bus_mode", "-")
+    bus_freq = health.get("bus_freq_hz", "-")
+    i2c_total = int(health.get("i2c_err_total", 0))
+    recover_total = int(health.get("recover_total", 0))
+    window_s = int(health.get("window_ms", PWR_DIAG_WINDOW_MS)) // 1000
+    return (
+        "🩺 System Health\n"
+        "Power: {} (score {})\n"
+        "Uptime: {}\n"
+        "Err rate: {}/min ({}s)\n"
+        "I2C errs: {} | Recovers: {}\n"
+        "Last recover: {}\n"
+        "Time sync: {}\n"
+        "Bus: {} @ {} Hz"
+    ).format(
+        power_txt,
+        score,
+        _fmt_uptime_hhmmss(uptime_s),
+        err_rate_txt,
+        window_s,
+        i2c_total,
+        recover_total,
+        last_recover_txt,
+        time_synced_txt,
+        bus_mode,
+        bus_freq,
+    )
 
 
 def render_alert_high(co2_f, temp_f, rh_f, reminder=False):
@@ -531,7 +586,7 @@ def apply_cfg_callback(state, cb_data):
 def tg_poll_commands(
     co2_raw, temp_raw, rh_raw, co2_f, temp_f, rh_f,
     sample_age_s, sensor_ok, wifi_ok, uptime_s, remind_ms, scd_scan, oled_scan, state,
-    time_synced, time_sync_error, local_time_txt, quiet_now
+    time_synced, time_sync_error, local_time_txt, quiet_now, health_snapshot
 ):
     global _last_update_id
     global _last_tg_chat_id
@@ -662,6 +717,9 @@ def tg_poll_commands(
                 tg_send(txt, reply_markup=kb, chat_id=chat_id)
             else:
                 tg_send(txt, chat_id=chat_id)
+        elif cmd == "health":
+            txt = render_health_card(uptime_s, health_snapshot)
+            tg_send(txt, chat_id=chat_id)
         elif cmd == "settings":
             txt, kb = render_menu_section(
                 "settings",

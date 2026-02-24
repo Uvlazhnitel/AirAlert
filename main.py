@@ -12,6 +12,7 @@ from config import *
 from state_store import apply_state_defaults, load_state
 from display_ui import draw_screen, draw_stale, draw_warmup, trend_from_delta
 from sensor_i2c import SCD41, create_scd_i2c, scan_hex, get_oled_probe, recover_shared_i2c
+from diagnostics import diag_init, diag_mark_i2c_err, diag_mark_recover, diag_compute
 from telegram_bot import (
     tg_send_alert,
     render_alert_high,
@@ -195,6 +196,7 @@ _time_sync_error = "not synced"
 def main():
     print("=== CO2 OLED Monitor ===")
     boot_ms = time.ticks_ms()
+    diag = diag_init(boot_ms)
 
     state = apply_state_defaults(load_state())
     warn_on = int(state["warn_on"])
@@ -331,6 +333,21 @@ def main():
     high_blink_phase = False
     stale_ui = False
     warmup_drawn = False
+    last_pwr_diag_log = time.ticks_add(time.ticks_ms(), -PWR_DIAG_LOG_EVERY_MS)
+    health_snapshot = {
+        "power_bad": False,
+        "score": 0,
+        "err_rate_per_min": 0.0,
+        "i2c_err_total": 0,
+        "recover_total": 0,
+        "sensor_err_total": 0,
+        "oled_init_err_total": 0,
+        "last_recover_age_s": "-",
+        "time_synced": False,
+        "bus_mode": "SHARED" if SHARED_I2C_BUS else "SEPARATE",
+        "bus_freq_hz": SHARED_I2C_FREQ if SHARED_I2C_BUS else SCD_I2C_FREQ,
+        "window_ms": PWR_DIAG_WINDOW_MS,
+    }
 
     while True:
         now = time.ticks_ms()
@@ -360,10 +377,13 @@ def main():
                         print("OLED not found at 0x3C")
             except Exception as e:
                 print("OLED init error:", e)
+                diag["diag_oled_init_err_total"] += 1
+                diag_mark_i2c_err(diag, now, "oled", PWR_DIAG_I2C_ERR_WEIGHT)
                 try:
                     i2c_scd, last_i2c_recover, recovered = recover_shared_i2c(now, last_i2c_recover, scd)
                     if recovered:
                         oled_ok = False
+                        diag_mark_recover(diag, now, PWR_DIAG_RECOVER_SCORE_WEIGHT)
                         print("I2C recover: shared bus reinit after OLED error")
                 except Exception as e2:
                     print("I2C recover error:", e2)
@@ -433,13 +453,56 @@ def main():
                     prev_lvl = lvl
             except Exception as e:
                 print("Sensor read error:", e)
+                diag["diag_sensor_err_total"] += 1
+                diag_mark_i2c_err(diag, now, "sensor", PWR_DIAG_I2C_ERR_WEIGHT)
                 try:
                     i2c_scd, last_i2c_recover, recovered = recover_shared_i2c(now, last_i2c_recover, scd)
                     if recovered:
                         oled_ok = False
+                        diag_mark_recover(diag, now, PWR_DIAG_RECOVER_SCORE_WEIGHT)
                         print("I2C recover: shared bus reinit after sensor error")
                 except Exception as e2:
                     print("I2C recover error:", e2)
+
+        prev_power_bad = diag.get("power_bad", False)
+        comp = diag_compute(
+            diag,
+            now,
+            {
+                "window_ms": PWR_DIAG_WINDOW_MS,
+                "bad_score": PWR_DIAG_BAD_SCORE,
+                "i2c_kind": "i2c_err",
+            },
+        )
+        if comp["power_bad"] and (not prev_power_bad):
+            diag["diag_last_power_bad_ms"] = now
+        if time.ticks_diff(now, last_pwr_diag_log) >= PWR_DIAG_LOG_EVERY_MS:
+            last_pwr_diag_log = now
+            print(
+                "PWR diag:",
+                "BAD" if comp["power_bad"] else "GOOD",
+                "score={}".format(comp["score"]),
+                "err_rate={:.2f}/min".format(comp["err_rate"]),
+                "recovers={}".format(diag["diag_recover_total"]),
+            )
+
+        last_recover_age_s = "-"
+        if diag["diag_last_recover_ms"] is not None:
+            last_recover_age_s = str(max(0, time.ticks_diff(now, diag["diag_last_recover_ms"]) // 1000))
+        health_snapshot = {
+            "power_bad": comp["power_bad"],
+            "score": comp["score"],
+            "err_rate_per_min": comp["err_rate"],
+            "i2c_err_total": diag["diag_i2c_err_total"],
+            "recover_total": diag["diag_recover_total"],
+            "sensor_err_total": diag["diag_sensor_err_total"],
+            "oled_init_err_total": diag["diag_oled_init_err_total"],
+            "last_recover_age_s": last_recover_age_s,
+            "time_synced": time_synced,
+            "bus_mode": "SHARED" if SHARED_I2C_BUS else "SEPARATE",
+            "bus_freq_hz": SHARED_I2C_FREQ if SHARED_I2C_BUS else SCD_I2C_FREQ,
+            "window_ms": PWR_DIAG_WINDOW_MS,
+        }
 
         if time.ticks_diff(now, last_ready_log) >= READY_LOG_EVERY_MS:
             last_ready_log = now
@@ -493,7 +556,7 @@ def main():
             warn_on, high_on, remind_min = tg_poll_commands(
                 co2, temp, rh, co2_f, temp_f, rh_f,
                 age_s, sensor_ok, wlan.isconnected(), uptime_s, remind_ms, ",".join(scd_scan), oled_scan, state,
-                time_synced, time_sync_error, local_time_txt, is_quiet_now()
+                time_synced, time_sync_error, local_time_txt, is_quiet_now(), health_snapshot
             )
             remind_ms = remind_min * 60 * 1000
 
